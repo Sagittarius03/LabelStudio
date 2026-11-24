@@ -19,7 +19,7 @@ jobs:
       - name: Install project dependencies
         run: uv sync --locked --group build
       - name: Build portable app
-        run: uv run pyinstaller --noconfirm --clean --windowed --name LabelStudio --add-data "logodeveloper.svg;." --collect-all pystrich --collect-all qrcode --collect-all barcode main.py
+        run: uv run pyinstaller --noconfirm --clean --windowed --name LabelStudio --icon assets/labelstudio.ico --add-data "logodeveloper.svg;." --add-data "assets;assets" --collect-all pystrich --collect-all qrcode --collect-all barcode main.py
       - name: Install Inno Setup
         run: choco install innosetup --yes --no-progress
       - name: Build installer

@@ -11,6 +11,7 @@ OutputBaseFilename=LabelStudio-Setup
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64
+SetupIconFile=assets\labelstudio.ico
 [Files]
 Source: "dist\LabelStudio\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 [Icons]
