@@ -1,0 +1,210 @@
+[Version]
+Signature="$Windows NT$"
+Class=Printer
+ClassGUID={4D36E979-E325-11CE-BFC1-08002BE10318}
+Provider="Seagull"
+DriverVer=07/01/2025,11.5.0.0
+CatalogFile=Beeprt.cat
+DriverIsolation=2
+
+[PrinterPackageInstallation.x86]
+PackageAware=TRUE
+
+[PrinterPackageInstallation.amd64]
+PackageAware=TRUE
+
+[SourceDisksNames]
+1="Seagull Drivers Disk",,,\Common
+2="Seagull Drivers Disk",,,\Common
+
+[SourceDisksNames.amd64]
+2="Seagull Drivers Disk",,,\x64
+
+[SourceDisksNames.x86]
+2="Seagull Drivers Disk",,,\Win32
+
+[SourceDisksFiles]
+Defaults[SS]_11.5.0.0.sds=1
+Seagull_TCPIP_PortMonitor.dll=2
+Seagull_TCPIP_PortMonitorUI.dll=2
+Seagull_V3_ConfigDispatcher.dll=2
+Seagull_V3_NetMonDispatcher.dll=2
+Seagull_V3_PrintDispatcher.dll=2
+ss#base_11.5.0.0.cab=2
+ss#base_11.5.0.0.ddz=1
+ss#tsc_11.5.0.0.cab=2
+ss#tsc_11.5.0.0.ddz=1
+sstcpipmon.ddz=1
+tscSS_11.5.0.0.ini=1
+tscSSenu_11.5.0.0.chm=1
+
+[DestinationDirs]
+FILES_PORT_MONITOR=11
+DefaultDestDir=66000
+
+[Manufacturer]
+"Beeprt"=MODEL_BEEPRT,NTamd64
+
+[PortMonitors]
+"Seagull Scientific Port"=SeagullTCPIPPortMonitor
+
+[SeagullTCPIPPortMonitor]
+CopyFiles=FILES_PORT_MONITOR
+PortMonitorDll=Seagull_TCPIP_PortMonitor.dll
+
+[FILES_PORT_MONITOR]
+Seagull_TCPIP_PortMonitor.dll
+Seagull_TCPIP_PortMonitorUI.dll
+sstcpipmon.ddz
+
+[MODEL_BEEPRT]
+"Beeprt BY-243"=TSC,USBPRINT\Beeprt_BY-243BE2F
+"Beeprt BY-243BT"=TSC,USBPRINT\Beeprt_BY-243BT1FAD
+"Beeprt BY-244"=TSC,USBPRINT\Beeprt_BY-2447C6E
+"Beeprt BY-244BT"=TSC,USBPRINT\Beeprt_BY-244BTDE1C
+"Beeprt BY-244G"=TSC,USBPRINT\Beeprt_BY-244GDEBD
+"Beeprt BY-244P"=TSC,USBPRINT\Beeprt_BY-244PD0FD
+"Beeprt BY-245"=TSC,USBPRINT\Beeprt_BY-245BCAF
+"Beeprt BY-245BT"=TSC,USBPRINT\Beeprt_BY-245BT1E4D
+"Beeprt BY-248"=TSC,USBPRINT\Beeprt_BY-248796E
+"Beeprt BY-248BT"=TSC,USBPRINT\Beeprt_BY-248BTDDDC
+"Beeprt BY-248G"=TSC,USBPRINT\Beeprt_BY-248GDEB8
+"Beeprt BY-290"=TSC,USBPRINT\Beeprt_BY-2902F6B
+"Beeprt BY-290BT"=TSC,USBPRINT\Beeprt_BY-290BTB35F
+"Beeprt BY-290E"=TSC,USBPRINT\Beeprt_BY-290E1CAF
+"Beeprt BY-290S"=TSC,USBPRINT\Beeprt_BY-290SD22E
+"Beeprt BY-348B"=TSC,USBPRINT\Beeprt_BY-348B2179
+"Beeprt BY-348BT"=TSC,USBPRINT\Beeprt_BY-348BT1DE1
+"Beeprt BY-368"=TSC,USBPRINT\Beeprt_BY-368D93E
+"Beeprt BY-368BT"=TSC,USBPRINT\Beeprt_BY-368BTA5E0
+"Beeprt BY-426"=TSC,USBPRINT\Beeprt_BY-4261C0C
+"Beeprt BY-426BT"=TSC,USBPRINT\Beeprt_BY-426BT9635
+"Beeprt BY-480"=TSC,USBPRINT\Beeprt_BY-480BE8A
+"Beeprt BY-480BT"=TSC,USBPRINT\Beeprt_BY-480BT4FD6
+"Beeprt BY-480BT_Pro"=TSC,USBPRINT\Beeprt_BY-480BT_Pro167F
+"Beeprt BY-482"=TSC,USBPRINT\Beeprt_BY-4827F0B
+"Beeprt BY-482BT"=TSC,USBPRINT\Beeprt_BY-482BT8F77
+"Beeprt BY-482G"=TSC,USBPRINT\Beeprt_BY-482GF57E
+"Beeprt BY-482P"=TSC,USBPRINT\Beeprt_BY-482PFB3E
+"Beeprt BY-483"=TSC,USBPRINT\Beeprt_BY-483BFCA
+"Beeprt BY-483BT"=TSC,USBPRINT\Beeprt_BY-483BT4F26
+"Beeprt BY-486"=TSC,USBPRINT\Beeprt_BY-486BC0A
+"Beeprt BY-486BT"=TSC,USBPRINT\Beeprt_BY-486BT4E36
+"Beeprt BY-490"=TSC,USBPRINT\Beeprt_BY-4902E8B
+"Beeprt BY-490P"=TSC,USBPRINT\Beeprt_BY-490P5B6E
+"Beeprt BY-492"=TSC,USBPRINT\Beeprt_BY-492EF0A
+"Beeprt BY-492P"=TSC,USBPRINT\Beeprt_BY-492P3B6F
+"Beeprt BY-493"=TSC,USBPRINT\Beeprt_BY-4932FCB
+"Beeprt BY-493P"=TSC,USBPRINT\Beeprt_BY-493PAB6E
+"Beeprt BY-495"=TSC,USBPRINT\Beeprt_BY-4952D4B
+"Beeprt BY-495P"=TSC,USBPRINT\Beeprt_BY-495P0B6D
+"Beeprt BY-496"=TSC,USBPRINT\Beeprt_BY-4962C0B
+"Beeprt BY-496BT"=TSC,USBPRINT\Beeprt_BY-496BTB237
+"Beeprt BY-496P"=TSC,USBPRINT\Beeprt_BY-496PFB6D
+"Beeprt BY-498"=TSC,USBPRINT\Beeprt_BY-498E88A
+"Beeprt BY-498BT"=TSC,USBPRINT\Beeprt_BY-498BT7156
+"Beeprt BY-498P"=TSC,USBPRINT\Beeprt_BY-498P9B69
+"Beeprt BY-3200"=TSC,USBPRINT\Beeprt_BY-3200C51E
+"Beeprt Label Printer (3 in)"=TSC,USBPRINT\Thermal_Label_3Print1B0D
+"Beeprt Label Printer (4 in)"=TSC,USBPRINT\Thermal_Label_PrinteC673
+"Beeprt LTK-230B"=TSC,USBPRINT\LTK-230B9BD8
+"Beeprt LTK-241"=TSC,USBPRINT\Beeprt_LTK-241383D
+"Beeprt LTK-241BT"=TSC,USBPRINT\Beeprt_LTK-241BT1D20
+"Beeprt LTK-241C"=TSC,USBPRINT\Beeprt_LTK-241C20B8
+"Beeprt LTK-244"=TSC,USBPRINT\Beeprt_LTK-2443BFD
+"Beeprt LTK-244BT"=TSC,USBPRINT\Beeprt_LTK-244BT1C30
+"Beeprt PP-480"=TSC,USBPRINT\Beeprt_PP-480B4D5
+"Beeprt PP-480BT"=TSC,USBPRINT\Beeprt_PP-480BTB86F
+"Beeprt PP-482"=TSC,USBPRINT\Beeprt_PP-4827554
+"Beeprt PP-482E"=TSC,USBPRINT\Beeprt_PP-482E0CB5
+
+[MODEL_BEEPRT.NTamd64]
+"Beeprt BY-243"=TSC,USBPRINT\Beeprt_BY-243BE2F
+"Beeprt BY-243BT"=TSC,USBPRINT\Beeprt_BY-243BT1FAD
+"Beeprt BY-244"=TSC,USBPRINT\Beeprt_BY-2447C6E
+"Beeprt BY-244BT"=TSC,USBPRINT\Beeprt_BY-244BTDE1C
+"Beeprt BY-244G"=TSC,USBPRINT\Beeprt_BY-244GDEBD
+"Beeprt BY-244P"=TSC,USBPRINT\Beeprt_BY-244PD0FD
+"Beeprt BY-245"=TSC,USBPRINT\Beeprt_BY-245BCAF
+"Beeprt BY-245BT"=TSC,USBPRINT\Beeprt_BY-245BT1E4D
+"Beeprt BY-248"=TSC,USBPRINT\Beeprt_BY-248796E
+"Beeprt BY-248BT"=TSC,USBPRINT\Beeprt_BY-248BTDDDC
+"Beeprt BY-248G"=TSC,USBPRINT\Beeprt_BY-248GDEB8
+"Beeprt BY-290"=TSC,USBPRINT\Beeprt_BY-2902F6B
+"Beeprt BY-290BT"=TSC,USBPRINT\Beeprt_BY-290BTB35F
+"Beeprt BY-290E"=TSC,USBPRINT\Beeprt_BY-290E1CAF
+"Beeprt BY-290S"=TSC,USBPRINT\Beeprt_BY-290SD22E
+"Beeprt BY-348B"=TSC,USBPRINT\Beeprt_BY-348B2179
+"Beeprt BY-348BT"=TSC,USBPRINT\Beeprt_BY-348BT1DE1
+"Beeprt BY-368"=TSC,USBPRINT\Beeprt_BY-368D93E
+"Beeprt BY-368BT"=TSC,USBPRINT\Beeprt_BY-368BTA5E0
+"Beeprt BY-426"=TSC,USBPRINT\Beeprt_BY-4261C0C
+"Beeprt BY-426BT"=TSC,USBPRINT\Beeprt_BY-426BT9635
+"Beeprt BY-480"=TSC,USBPRINT\Beeprt_BY-480BE8A
+"Beeprt BY-480BT"=TSC,USBPRINT\Beeprt_BY-480BT4FD6
+"Beeprt BY-480BT_Pro"=TSC,USBPRINT\Beeprt_BY-480BT_Pro167F
+"Beeprt BY-482"=TSC,USBPRINT\Beeprt_BY-4827F0B
+"Beeprt BY-482BT"=TSC,USBPRINT\Beeprt_BY-482BT8F77
+"Beeprt BY-482G"=TSC,USBPRINT\Beeprt_BY-482GF57E
+"Beeprt BY-482P"=TSC,USBPRINT\Beeprt_BY-482PFB3E
+"Beeprt BY-483"=TSC,USBPRINT\Beeprt_BY-483BFCA
+"Beeprt BY-483BT"=TSC,USBPRINT\Beeprt_BY-483BT4F26
+"Beeprt BY-486"=TSC,USBPRINT\Beeprt_BY-486BC0A
+"Beeprt BY-486BT"=TSC,USBPRINT\Beeprt_BY-486BT4E36
+"Beeprt BY-490"=TSC,USBPRINT\Beeprt_BY-4902E8B
+"Beeprt BY-490P"=TSC,USBPRINT\Beeprt_BY-490P5B6E
+"Beeprt BY-492"=TSC,USBPRINT\Beeprt_BY-492EF0A
+"Beeprt BY-492P"=TSC,USBPRINT\Beeprt_BY-492P3B6F
+"Beeprt BY-493"=TSC,USBPRINT\Beeprt_BY-4932FCB
+"Beeprt BY-493P"=TSC,USBPRINT\Beeprt_BY-493PAB6E
+"Beeprt BY-495"=TSC,USBPRINT\Beeprt_BY-4952D4B
+"Beeprt BY-495P"=TSC,USBPRINT\Beeprt_BY-495P0B6D
+"Beeprt BY-496"=TSC,USBPRINT\Beeprt_BY-4962C0B
+"Beeprt BY-496BT"=TSC,USBPRINT\Beeprt_BY-496BTB237
+"Beeprt BY-496P"=TSC,USBPRINT\Beeprt_BY-496PFB6D
+"Beeprt BY-498"=TSC,USBPRINT\Beeprt_BY-498E88A
+"Beeprt BY-498BT"=TSC,USBPRINT\Beeprt_BY-498BT7156
+"Beeprt BY-498P"=TSC,USBPRINT\Beeprt_BY-498P9B69
+"Beeprt BY-3200"=TSC,USBPRINT\Beeprt_BY-3200C51E
+"Beeprt Label Printer (3 in)"=TSC,USBPRINT\Thermal_Label_3Print1B0D
+"Beeprt Label Printer (4 in)"=TSC,USBPRINT\Thermal_Label_PrinteC673
+"Beeprt LTK-230B"=TSC,USBPRINT\LTK-230B9BD8
+"Beeprt LTK-241"=TSC,USBPRINT\Beeprt_LTK-241383D
+"Beeprt LTK-241BT"=TSC,USBPRINT\Beeprt_LTK-241BT1D20
+"Beeprt LTK-241C"=TSC,USBPRINT\Beeprt_LTK-241C20B8
+"Beeprt LTK-244"=TSC,USBPRINT\Beeprt_LTK-2443BFD
+"Beeprt LTK-244BT"=TSC,USBPRINT\Beeprt_LTK-244BT1C30
+"Beeprt PP-480"=TSC,USBPRINT\Beeprt_PP-480B4D5
+"Beeprt PP-480BT"=TSC,USBPRINT\Beeprt_PP-480BTB86F
+"Beeprt PP-482"=TSC,USBPRINT\Beeprt_PP-4827554
+"Beeprt PP-482E"=TSC,USBPRINT\Beeprt_PP-482E0CB5
+
+[FILES_BASE_COMMON]
+ss#base_11.5.0.0.ddz
+
+[FILES_BASE_PLATFORM]
+ss#base_11.5.0.0.cab
+Seagull_V3_NetMonDispatcher.dll
+Seagull_V3_PrintDispatcher.dll
+Seagull_V3_ConfigDispatcher.dll
+
+[FILES_TSC_COMMON]
+ss#tsc_11.5.0.0.ddz
+Defaults[SS]_11.5.0.0.sds
+tscSSenu_11.5.0.0.chm
+tscSS_11.5.0.0.ini
+
+[FILES_TSC_PLATFORM]
+ss#tsc_11.5.0.0.cab
+
+[TSC]
+DriverFile=Seagull_V3_PrintDispatcher.dll
+ConfigFile=Seagull_V3_ConfigDispatcher.dll
+DataFile=tscSS_11.5.0.0.ini
+HelpFile=tscSSenu_11.5.0.0.chm
+LanguageMonitor="Seagull V3 Network Monitor,Seagull_V3_NetMonDispatcher.dll"
+CopyFiles=FILES_BASE_COMMON,FILES_BASE_PLATFORM,FILES_TSC_COMMON,FILES_TSC_PLATFORM
+
+[TSC.Services]
+AddService=,0x2
+

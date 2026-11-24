@@ -1,0 +1,8 @@
+.venv/
+.python-version
+__pycache__/
+*.py[cod]
+dist/
+build/
+*.spec
+*.log

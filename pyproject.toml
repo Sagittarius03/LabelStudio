@@ -1,0 +1,23 @@
+[project]
+name = "label-studio"
+version = "0.1.0"
+description = "Редактор шаблонов этикеток и пакетная печать"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.8,<7",
+    "openpyxl>=3.1,<4",
+    "qrcode[pil]>=8,<9",
+    "python-barcode[images]>=0.15,<1",
+    "pystrich>=0.21,<0.22",
+    "Pillow>=10,<13",
+]
+
+[dependency-groups]
+build = [
+    "pyinstaller>=6.10,<7; sys_platform == 'win32'",
+]
+
+[tool.uv]
+package = false
+required-version = ">=0.13.9,<0.14"
