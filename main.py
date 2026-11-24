@@ -13,10 +13,10 @@ from typing import Any
 from PySide6.QtCore import Qt, QSizeF, QRectF, QPointF, Signal, QMarginsF, QSettings, QByteArray
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QPageSize, QPageLayout, QAction, QKeySequence, QShortcut, QIcon
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtPrintSupport import QPrinter, QPrintDialog
+from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewWidget, QPrinterInfo
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QComboBox, QColorDialog, QDoubleSpinBox, QGridLayout, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QFontComboBox,
+    QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QFontComboBox, QInputDialog,
     QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton, QMenu,
     QToolBar, QVBoxLayout, QWidget, QHeaderView, QListWidget, QListWidgetItem, QScrollArea, QDockWidget,
 )
@@ -57,6 +57,7 @@ class Element:
     line_width: float = 0.35
     line_style: str = "solid"
     asset_data: str = ""
+    layer_locked: bool = False
 
 
 def extract_gs1_fields(raw: str) -> dict[str, str]:
@@ -122,8 +123,258 @@ class CompositionBlock:
     copies: int = 1
 
 
+class PrintPreviewDialog(QDialog):
+    def __init__(self,parent,printer,available,start,end,copies,orientation,continue_sequence,build_order,render_callback,print_callback):
+        super().__init__(parent)
+        self.owner=parent;self.printer=printer;self.available=available;self.build_order=build_order
+        self.render_callback=render_callback;self.print_callback=print_callback
+        self.columns=parent.label_columns;self.gap=parent.column_gap
+        self.setWindowTitle("Печать этикеток");self.resize(1280,840);self.setMinimumSize(1000,680)
+        self.setStyleSheet("""
+            QDialog { background:#eef2f7; color:#1d2939; }
+            QFrame#topBar { background:#2563eb; border-radius:9px; }
+            QFrame#settingsCard,QFrame#previewCard { background:#ffffff; border:1px solid #d8e0eb; border-radius:10px; }
+            QLabel { color:#263447; }
+            QLabel#title { color:white; font-size:20px; font-weight:700; }
+            QLabel#section { color:#344054; font-size:13px; font-weight:700; }
+            QLabel#hint { color:#667085; font-size:11px; }
+            QComboBox,QSpinBox { color:#202a39; background:white; border:1px solid #cbd5e1; border-radius:6px; padding:7px; min-height:24px; }
+            QCheckBox { color:#344054; spacing:8px; }
+            QPushButton { color:#263447; background:#ffffff; border:1px solid #cbd5e1; border-radius:6px; padding:8px 11px; }
+            QPushButton:hover { background:#f0f5ff; border-color:#8aafff; }
+            QPushButton#primaryPrint { background:#2563eb; color:white; border:0; font-size:15px; font-weight:700; padding:13px; }
+            QPushButton#primaryPrint:hover { background:#1d4ed8; }
+        """)
+        root=QVBoxLayout(self);root.setContentsMargins(14,14,14,14);root.setSpacing(12)
+        top=QFrame();top.setObjectName("topBar");top_layout=QHBoxLayout(top);top_layout.setContentsMargins(18,12,18,12)
+        title=QLabel("Печать этикеток");title.setObjectName("title");top_layout.addWidget(title);top_layout.addStretch()
+        self.variation_label=QLabel(f"Доступно вариантов: {available}");self.variation_label.setStyleSheet("color:#eaf1ff;font-size:12px");top_layout.addWidget(self.variation_label);root.addWidget(top)
+        body=QHBoxLayout();body.setSpacing(12);root.addLayout(body,1)
+
+        left=QFrame();left.setObjectName("settingsCard");left.setFixedWidth(370);left_layout=QVBoxLayout(left);left_layout.setContentsMargins(18,16,18,16);left_layout.setSpacing(11)
+        printer_title=QLabel("ПРИНТЕР");printer_title.setObjectName("section");left_layout.addWidget(printer_title)
+        printer_row=QHBoxLayout();self.printer_combo=QComboBox();self.printer_combo.setMinimumWidth(205);printer_row.addWidget(self.printer_combo,1)
+        self.refresh_button=QPushButton("⟳");self.refresh_button.setToolTip("Обновить список принтеров");printer_row.addWidget(self.refresh_button);left_layout.addLayout(printer_row)
+        self.printer_settings_button=QPushButton("Настройки принтера…");left_layout.addWidget(self.printer_settings_button)
+        profile_row=QHBoxLayout();self.profile_combo=QComboBox();self.profile_combo.setMinimumWidth(140);self.profile_combo.setToolTip("Сохранённые профили печати")
+        self.profile_save_button=QPushButton("＋");self.profile_save_button.setToolTip("Сохранить текущие настройки как профиль")
+        self.profile_delete_button=QPushButton("−");self.profile_delete_button.setToolTip("Удалить выбранный профиль")
+        profile_row.addWidget(self.profile_combo,1);profile_row.addWidget(self.profile_save_button);profile_row.addWidget(self.profile_delete_button);left_layout.addLayout(profile_row)
+        left_layout.addSpacing(4);range_title=QLabel("ДИАПАЗОН ВАРИАНТОВ");range_title.setObjectName("section");left_layout.addWidget(range_title)
+        range_row=QHBoxLayout();self.start_spin=QSpinBox();self.end_spin=QSpinBox()
+        for spin in (self.start_spin,self.end_spin):spin.setRange(1,max(1,available))
+        self.start_spin.setValue(min(max(1,start),max(1,available)));self.end_spin.setValue(min(max(self.start_spin.value(),end),max(1,available)))
+        range_row.addWidget(self.start_spin);range_row.addWidget(QLabel("по"));range_row.addWidget(self.end_spin);left_layout.addLayout(range_row)
+        range_hint=QLabel("Выберите номера строк данных, которые нужно напечатать.");range_hint.setObjectName("hint");range_hint.setWordWrap(True);left_layout.addWidget(range_hint)
+        copies_title=QLabel("КОЛИЧЕСТВО КОПИЙ ДИАПАЗОНА");copies_title.setObjectName("section");left_layout.addWidget(copies_title)
+        self.copies_spin=QSpinBox();self.copies_spin.setRange(1,9999);self.copies_spin.setValue(max(1,copies));left_layout.addWidget(self.copies_spin)
+        orientation_title=QLabel("ОРИЕНТАЦИЯ НОСИТЕЛЯ");orientation_title.setObjectName("section");left_layout.addWidget(orientation_title)
+        self.orientation_combo=QComboBox();self.orientation_combo.addItem("Книжная",QPageLayout.Orientation.Portrait.value);self.orientation_combo.addItem("Альбомная",QPageLayout.Orientation.Landscape.value)
+        self.orientation_combo.setCurrentIndex(max(0,self.orientation_combo.findData(orientation.value)));left_layout.addWidget(self.orientation_combo)
+        self.preflight_check=QCheckBox("Проверять макет перед печатью")
+        self.preflight_check.setChecked(bool(parent.settings.value("print/preflight",True)))
+        left_layout.addWidget(self.preflight_check)
+        self.advanced_toggle=QToolButton();self.advanced_toggle.setText("Дополнительные параметры  ▸");self.advanced_toggle.setCheckable(True);self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly);left_layout.addWidget(self.advanced_toggle)
+        self.advanced_panel=QFrame();advanced_layout=QVBoxLayout(self.advanced_panel);advanced_layout.setContentsMargins(4,0,4,0)
+        self.continue_check=QCheckBox("Продолжать {SEQ} между копиями диапазона");self.continue_check.setChecked(continue_sequence);advanced_layout.addWidget(self.continue_check)
+        self.reverse_check=QCheckBox("Печатать диапазон в обратном порядке");advanced_layout.addWidget(self.reverse_check)
+        self.columns_label=QLabel();self.columns_label.setObjectName("hint");advanced_layout.addWidget(self.columns_label)
+        self.columns_button=QPushButton("Настроить колонки ленты…");advanced_layout.addWidget(self.columns_button);self.advanced_panel.hide();left_layout.addWidget(self.advanced_panel)
+        left_layout.addStretch()
+        self.summary=QLabel();self.summary.setStyleSheet("font-size:12px;font-weight:600;color:#344054;padding:7px 0");self.summary.setWordWrap(True);left_layout.addWidget(self.summary)
+        self.print_button=QPushButton("Печать");self.print_button.setObjectName("primaryPrint");left_layout.addWidget(self.print_button)
+        self.cancel_button=QPushButton("Отмена");left_layout.addWidget(self.cancel_button)
+        body.addWidget(left)
+
+        preview_card=QFrame();preview_card.setObjectName("previewCard");preview_layout=QVBoxLayout(preview_card);preview_layout.setContentsMargins(14,12,14,12);preview_layout.setSpacing(9)
+        preview_head=QHBoxLayout();preview_title=QLabel("ПРЕДВАРИТЕЛЬНЫЙ ПРОСМОТР");preview_title.setObjectName("section");preview_head.addWidget(preview_title);preview_head.addStretch()
+        self.page_spin=QSpinBox();self.page_spin.setRange(1,1);preview_head.addWidget(QLabel("Страница"));preview_head.addWidget(self.page_spin);self.page_total=QLabel("из 1");preview_head.addWidget(self.page_total)
+        zoom_out=QPushButton("−");zoom_in=QPushButton("+");fit_width=QPushButton("По ширине");fit_page=QPushButton("Целиком")
+        for button in (zoom_out,zoom_in,fit_width,fit_page):preview_head.addWidget(button)
+        preview_layout.addLayout(preview_head)
+        self.preview=QPrintPreviewWidget(printer,self);self.preview.setZoomMode(QPrintPreviewWidget.ZoomMode.FitInView);preview_layout.addWidget(self.preview,1)
+        body.addWidget(preview_card,1)
+
+        self._refresh_profile_list()
+        self._fill_printers()
+        self.printer_combo.currentIndexChanged.connect(self._printer_changed)
+        self.profile_combo.currentIndexChanged.connect(self._apply_selected_profile)
+        self.profile_save_button.clicked.connect(self._save_profile)
+        self.profile_delete_button.clicked.connect(self._delete_profile)
+        self.refresh_button.clicked.connect(self._fill_printers)
+        self.printer_settings_button.clicked.connect(self._open_printer_settings)
+        self.advanced_toggle.toggled.connect(self._toggle_advanced)
+        self.start_spin.valueChanged.connect(self._range_changed);self.end_spin.valueChanged.connect(self._range_changed)
+        self.copies_spin.valueChanged.connect(self._refresh_job)
+        self.orientation_combo.currentIndexChanged.connect(self._refresh_job)
+        self.continue_check.toggled.connect(self._refresh_job);self.reverse_check.toggled.connect(self._refresh_job)
+        self.columns_button.clicked.connect(self._configure_columns)
+        self.preview.paintRequested.connect(self._paint_preview);self.preview.previewChanged.connect(self._sync_pages)
+        self.page_spin.valueChanged.connect(self.preview.setCurrentPage)
+        zoom_out.clicked.connect(self.preview.zoomOut);zoom_in.clicked.connect(self.preview.zoomIn)
+        fit_width.clicked.connect(lambda:self.preview.setZoomMode(QPrintPreviewWidget.ZoomMode.FitToWidth))
+        fit_page.clicked.connect(lambda:self.preview.setZoomMode(QPrintPreviewWidget.ZoomMode.FitInView))
+        self.print_button.clicked.connect(self._print);self.cancel_button.clicked.connect(self.reject)
+        self._refresh_job()
+
+    def _fill_printers(self):
+        old=str(self.owner.settings.value("printer/name",self.printer.printerName() or ""))
+        infos=QPrinterInfo.availablePrinters();self.printer_combo.blockSignals(True);self.printer_combo.clear()
+        for info in infos:self.printer_combo.addItem(info.printerName(),info.printerName())
+        if old and self.printer_combo.findData(old)<0:self.printer_combo.addItem(old,old)
+        if not infos and not old:self.printer_combo.addItem("Системный принтер"," ")
+        index=self.printer_combo.findData(old)
+        if index<0 and infos:index=self.printer_combo.findData(QPrinterInfo.defaultPrinter().printerName())
+        self.printer_combo.setCurrentIndex(max(0,index));self.printer_combo.blockSignals(False)
+        self._printer_changed()
+
+    def _printer_changed(self,*_):
+        name=str(self.printer_combo.currentData() or "").strip()
+        if name and self.printer.printerName()!=name:self.printer.setPrinterName(name)
+        if name:
+            self.owner.settings.setValue("printer/name",name)
+            self.owner.settings.sync()
+        self._refresh_job()
+
+    def _profiles(self):
+        try:return json.loads(str(self.owner.settings.value("printer/profiles","{}")))
+        except (TypeError,ValueError):return {}
+
+    def _refresh_profile_list(self,selected=""):
+        profiles=self._profiles();self.profile_combo.blockSignals(True);self.profile_combo.clear()
+        self.profile_combo.addItem("Профиль печати…","")
+        for name in sorted(profiles,key=str.casefold):self.profile_combo.addItem(name,name)
+        index=self.profile_combo.findData(selected) if selected else 0
+        self.profile_combo.setCurrentIndex(max(0,index));self.profile_combo.blockSignals(False)
+        self.profile_delete_button.setEnabled(bool(selected))
+
+    def _save_profile(self):
+        name,accepted=QInputDialog.getText(self,"Сохранить профиль печати","Название профиля:")
+        name=name.strip()
+        if not accepted or not name:return
+        profile={"printer_name":self.printer.printerName(),"resolution":self.printer.resolution(),
+                 "color_mode":self.printer.colorMode().value,"duplex":self.printer.duplex().value,
+                 "paper_source":self.printer.paperSource().value,"page_order":self.printer.pageOrder().value,
+                 "collate":self.printer.collateCopies(),"orientation":self.orientation_combo.currentData(),
+                 "columns":self.owner.label_columns,"column_gap":self.owner.column_gap}
+        profiles=self._profiles();profiles[name]=profile
+        self.owner.settings.setValue("printer/profiles",json.dumps(profiles,ensure_ascii=False));self.owner.settings.sync()
+        self._refresh_profile_list(name)
+
+    def _apply_selected_profile(self,index):
+        name=self.profile_combo.itemData(index)
+        if not name:return
+        profile=self._profiles().get(str(name),{})
+        printer_name=str(profile.get("printer_name", ""))
+        if printer_name:
+            combo_index=self.printer_combo.findData(printer_name)
+            if combo_index<0:self.printer_combo.addItem(printer_name,printer_name);combo_index=self.printer_combo.findData(printer_name)
+            self.printer_combo.blockSignals(True);self.printer_combo.setCurrentIndex(combo_index);self.printer_combo.blockSignals(False)
+            self.printer.setPrinterName(printer_name)
+        try:
+            if "resolution" in profile:self.printer.setResolution(int(profile["resolution"]))
+            if "color_mode" in profile:self.printer.setColorMode(QPrinter.ColorMode(int(profile["color_mode"])))
+            if "duplex" in profile:self.printer.setDuplex(QPrinter.DuplexMode(int(profile["duplex"])))
+            if "paper_source" in profile:self.printer.setPaperSource(QPrinter.PaperSource(int(profile["paper_source"])))
+            if "page_order" in profile:self.printer.setPageOrder(QPrinter.PageOrder(int(profile["page_order"])))
+            if "collate" in profile:self.printer.setCollateCopies(bool(profile["collate"]))
+        except (TypeError,ValueError):pass
+        if profile.get("orientation") is not None:
+            orientation_index=self.orientation_combo.findData(profile["orientation"])
+            if orientation_index>=0:self.orientation_combo.setCurrentIndex(orientation_index)
+        if profile.get("columns"):
+            self.owner.label_columns=max(1,int(profile["columns"]))
+            self.owner.column_gap=max(0.0,float(profile.get("column_gap",0)))
+            self.owner.settings.setValue("label_columns",self.owner.label_columns);self.owner.settings.setValue("column_gap",self.owner.column_gap)
+        self.owner.settings.setValue("printer/name",printer_name);self._save_printer_settings();self._refresh_job()
+
+    def _delete_profile(self):
+        name=str(self.profile_combo.currentData() or "")
+        if not name:return
+        answer=QMessageBox.question(self,"Удалить профиль",f"Удалить профиль «{name}»?")
+        if answer!=QMessageBox.StandardButton.Yes:return
+        profiles=self._profiles();profiles.pop(name,None)
+        self.owner.settings.setValue("printer/profiles",json.dumps(profiles,ensure_ascii=False));self.owner.settings.sync()
+        self._refresh_profile_list()
+
+    def _configure_page(self):
+        self.columns=self.owner.label_columns;self.gap=self.owner.column_gap
+        self.page_width=self.owner.template.width*self.columns+self.gap*(self.columns-1)
+        self.printer.setPageSize(QPageSize(QSizeF(self.page_width,self.owner.template.height),QPageSize.Unit.Millimeter,"Label layout"))
+        self.printer.setPageOrientation(QPageLayout.Orientation(self.orientation_combo.currentData()))
+        self.printer.setPageMargins(QMarginsF(0,0,0,0),QPageLayout.Unit.Millimeter);self.printer.setFullPage(True)
+        self.printer.setCopyCount(1)  # Copies are expanded into the page sequence by the app.
+        self.columns_label.setText(f"Текущая раскладка: {self.columns} колонок · зазор {self.gap:.2f} мм")
+
+    def _refresh_job(self,*_):
+        if not hasattr(self,"orientation_combo"):return
+        if self.end_spin.value()<self.start_spin.value():
+            self.end_spin.blockSignals(True);self.end_spin.setValue(self.start_spin.value());self.end_spin.blockSignals(False)
+        self.ordered=self.build_order(self.start_spin.value(),self.end_spin.value(),self.copies_spin.value(),self.continue_check.isChecked(),self.reverse_check.isChecked())
+        self._configure_page()
+        pages=max(1,(len(self.ordered)+self.columns-1)//self.columns)
+        self.summary.setText(f"Этикеток: {len(self.ordered)}    Страниц: {pages}\nВарианты: {self.start_spin.value()}–{self.end_spin.value()} · копий диапазона: {self.copies_spin.value()}")
+        self.variation_label.setText(f"{self.available} вариантов доступно")
+        self.preview.updatePreview();self._sync_pages()
+
+    def _range_changed(self,*_):self._refresh_job()
+
+    def _toggle_advanced(self,checked):
+        self.advanced_panel.setVisible(checked);self.advanced_toggle.setText("Дополнительные параметры  ▾" if checked else "Дополнительные параметры  ▸")
+
+    def _configure_columns(self):
+        self.owner.configure_column_layout();self._refresh_job()
+
+    def _open_printer_settings(self):
+        name=str(self.printer_combo.currentData() or "").strip()
+        if name:self.printer.setPrinterName(name)
+        self._configure_page()
+        dialog=QPrintDialog(self.printer,self);dialog.setWindowTitle("Настройки выбранного принтера")
+        if dialog.exec()==QDialog.DialogCode.Accepted:
+            actual=self.printer.printerName()
+            index=self.printer_combo.findData(actual)
+            if index<0:self.printer_combo.addItem(actual,actual);index=self.printer_combo.findData(actual)
+            self.printer_combo.blockSignals(True);self.printer_combo.setCurrentIndex(index);self.printer_combo.blockSignals(False)
+            self._save_printer_settings();self._refresh_job()
+
+    def _save_printer_settings(self):
+        settings=self.owner.settings
+        settings.setValue("printer/name",self.printer.printerName());settings.setValue("printer/resolution",self.printer.resolution())
+        settings.setValue("printer/color_mode",self.printer.colorMode().value);settings.setValue("printer/duplex",self.printer.duplex().value)
+        settings.setValue("printer/paper_source",self.printer.paperSource().value);settings.setValue("printer/page_order",self.printer.pageOrder().value)
+        settings.setValue("printer/collate",self.printer.collateCopies());settings.sync()
+
+    def _paint_preview(self,printer):
+        self._configure_page();self.render_callback(printer,self.ordered,self.columns,self.page_width)
+
+    def _sync_pages(self,*_):
+        if not hasattr(self,"page_spin"):return
+        count=max(1,self.preview.pageCount());current=max(1,self.preview.currentPage())
+        self.page_spin.blockSignals(True);self.page_spin.setRange(1,count);self.page_spin.setValue(min(current,count));self.page_spin.blockSignals(False)
+        self.page_total.setText(f"из {count}")
+
+    def _print(self):
+        self.owner.settings.setValue("print/range_start",self.start_spin.value());self.owner.settings.setValue("print/range_end",self.end_spin.value())
+        self.owner.settings.setValue("print/copies",self.copies_spin.value());self.owner.settings.setValue("print/orientation",self.orientation_combo.currentData())
+        self.owner.settings.setValue("print/continue_sequence",self.continue_check.isChecked());self.owner.settings.sync()
+        self.owner.settings.setValue("print/preflight",self.preflight_check.isChecked());self.owner.settings.sync()
+        if self.preflight_check.isChecked():
+            issues=self.owner.validate_print_job(self.ordered)
+            if issues:
+                message="Перед печатью найдены замечания:\n\n"+"\n".join(f"• {item}" for item in issues[:20])
+                if len(issues)>20:message+=f"\n…и ещё {len(issues)-20}"
+                message+="\n\nПродолжить печать?"
+                if QMessageBox.question(self,"Проверка перед печатью",message,QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
+        self._save_printer_settings();self._configure_page()
+        try:
+            if not self.print_callback(self.printer,self.ordered,self.columns,self.page_width,
+                                       self.start_spin.value(),self.end_spin.value(),self.copies_spin.value()):return
+        except Exception as exc:QMessageBox.critical(self,"Ошибка печати",str(exc));return
+        self.accept()
+
 class LabelCanvas(QWidget):
     selected = Signal(int)
+    elementDoubleClicked = Signal(int)
     moved = Signal()
     zoomChanged = Signal(float)
 
@@ -195,8 +446,11 @@ class LabelCanvas(QWidget):
                 p.setPen(QPen(QColor(ACCENT), 1.5, Qt.PenStyle.DashLine))
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawRect(r)
-                p.setPen(QPen(QColor(ACCENT),1)); p.setBrush(QColor("#ffffff"))
-                for point in self._handle_points(r): p.drawRect(QRectF(point.x()-3.5,point.y()-3.5,7,7))
+                if not el.layer_locked:
+                    p.setPen(QPen(QColor(ACCENT),1)); p.setBrush(QColor("#ffffff"))
+                    for point in self._handle_points(r): p.drawRect(QRectF(point.x()-3.5,point.y()-3.5,7,7))
+                else:
+                    p.setPen(QColor("#b42318"));p.drawText(QPointF(r.left(),r.top()-5),"LOCKED")
                 if self.show_guides:
                     p.setPen(QPen(QColor(ACCENT + "88"), 1, Qt.PenStyle.DotLine))
                     p.drawLine(int(r.center().x()), int(y0), int(r.center().x()), int(y0 + h))
@@ -410,19 +664,20 @@ class LabelCanvas(QWidget):
         ox, oy = getattr(self, "origin", (0, 0)); scale = self.scale
         if 0 <= self.selected_index < len(self.template.elements):
             el=self.template.elements[self.selected_index]
-            selected_rect=QRectF(ox+el.x*scale,oy+el.y*scale,el.width*scale,el.height*scale)
-            local=self._unrotate(event.position(),selected_rect,el.rotation)
-            handle=self._hit_resize_handle(local,selected_rect)
-            if handle:
-                self.resize_data=(handle,event.position().x(),event.position().y(),el.x,el.y,el.width,el.height,el.rotation)
-                self.drag_start=None; self.drag_offset=None; return
+            if not el.layer_locked:
+                selected_rect=QRectF(ox+el.x*scale,oy+el.y*scale,el.width*scale,el.height*scale)
+                local=self._unrotate(event.position(),selected_rect,el.rotation)
+                handle=self._hit_resize_handle(local,selected_rect)
+                if handle:
+                    self.resize_data=(handle,event.position().x(),event.position().y(),el.x,el.y,el.width,el.height,el.rotation)
+                    self.drag_start=None; self.drag_offset=None; return
         for i in range(len(self.template.elements) - 1, -1, -1):
             el = self.template.elements[i]
             r = QRectF(ox + el.x * scale, oy + el.y * scale, el.width * scale, el.height * scale)
             local = self._unrotate(event.position(), r, el.rotation)
             if r.contains(local):
                 self.selected_index = i
-                self.drag_start = (event.position().x(),event.position().y(),el.x,el.y,el.rotation)
+                self.drag_start = None if el.layer_locked else (event.position().x(),event.position().y(),el.x,el.y,el.rotation)
                 self.drag_offset = (0,0)
                 self.selected.emit(i); self.update(); self.setFocus(); return
         if self.show_guides:
@@ -443,11 +698,12 @@ class LabelCanvas(QWidget):
             raw = (event.position().x() - ox) / self.scale if guide["orientation"] == "vertical" else (event.position().y() - oy) / self.scale
             limit = self.template.width if guide["orientation"] == "vertical" else self.template.height
             guide["position"] = round(min(max(raw, 0), limit), 3); self.update(); return
-        if self.resize_data is not None and 0 <= self.selected_index < len(self.template.elements):
+        if self.resize_data is not None and 0 <= self.selected_index < len(self.template.elements) and not self.template.elements[self.selected_index].layer_locked:
             self._resize_selected(event.position()); self.moved.emit(); self.update(); return
         if self.drag_start is None or self.selected_index < 0:
             return
         el = self.template.elements[self.selected_index]
+        if el.layer_locked:return
         sx,sy,start_x,start_y,angle=self.drag_start
         dx=event.position().x()-sx; dy=event.position().y()-sy
         proposed_x=round(max(0,start_x+dx/self.scale),3); proposed_y=round(max(0,start_y+dy/self.scale),3)
@@ -473,6 +729,14 @@ class LabelCanvas(QWidget):
 
     def mouseDoubleClickEvent(self,event):
         if event.button()==Qt.MouseButton.LeftButton and not self.pan_mode:
+            ox,oy=getattr(self,"origin",(0,0))
+            for index in range(len(self.template.elements)-1,-1,-1):
+                element=self.template.elements[index]
+                rect=QRectF(ox+element.x*self.scale,oy+element.y*self.scale,element.width*self.scale,element.height*self.scale)
+                if rect.contains(self._unrotate(event.position(),rect,element.rotation)):
+                    self.selected_index=index;self.selected.emit(index);self.update()
+                    if element.kind in ("text","symbol","qr","barcode","datamatrix"):self.elementDoubleClicked.emit(index)
+                    event.accept();return
             self.reset_view();event.accept();return
         super().mouseDoubleClickEvent(event)
 
@@ -530,7 +794,7 @@ class LabelCanvas(QWidget):
 
     def keyPressEvent(self, event):
         el = self.template.elements[self.selected_index] if 0 <= self.selected_index < len(self.template.elements) else None
-        if el and event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
+        if el and not el.layer_locked and event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
             step = 1.0 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else .1
             dx = step if event.key() == Qt.Key.Key_Right else -step if event.key() == Qt.Key.Key_Left else 0
             dy = step if event.key() == Qt.Key.Key_Down else -step if event.key() == Qt.Key.Key_Up else 0
@@ -754,13 +1018,16 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP)
         self.resize(1440, 900)
-        self.settings=QSettings("DataMatrixPrinter","LabelStudio")
+        self.settings=QSettings("DataMatrixPrinter","LabelStudioTemplateEditor" if editor_only else "LabelStudio")
+        self.print_printer=None
         self.template = initial_template or LabelTemplate(elements=[Element()])
         self.rows: list[dict[str, Any]] = []
         self.headers: list[str] = []
         self.selected_file = ""
         self.template_path: Path | None = initial_path
         self.editor_only=editor_only
+        self.object_clipboard: Element | None=None
+        self.object_clipboard_paste_count=0
         self.composition_blocks: list[CompositionBlock] = [CompositionBlock(None,self.template,1)]
         self.label_columns = int(self.settings.value("label_columns",1))
         self.column_gap = float(self.settings.value("column_gap",0.0))
@@ -773,9 +1040,12 @@ class MainWindow(QMainWindow):
         self._style()
         dock_state=self.settings.value("dock_state")
         geometry=self.settings.value("window_geometry")
-        if dock_state: self.restoreState(dock_state)
-        if geometry: self.restoreGeometry(geometry)
+        if not self.editor_only and dock_state:self.restoreState(dock_state)
+        if not self.editor_only and geometry:self.restoreGeometry(geometry)
         if self.editor_only:self.data_dock.hide()
+        else:
+            self.data_dock.setVisible(True)
+            self.preview_dock.setVisible(True)
 
     def _build_ui(self):
         toolbar = QToolBar(); toolbar.setObjectName("mainToolbar"); toolbar.setMovable(False); toolbar.setIconSize(QSizeF(18, 18).toSize()); self.addToolBar(toolbar)
@@ -813,6 +1083,13 @@ class MainWindow(QMainWindow):
         self.object_list = QListWidget(); self.object_list.setObjectName("objectList")
         self.object_list.currentRowChanged.connect(self.select_element)
         ll.addWidget(self.object_list, 1)
+        layer_controls=QHBoxLayout()
+        self.layer_up_btn=QPushButton("↑");self.layer_up_btn.setToolTip("Поднять слой выше");self.layer_up_btn.clicked.connect(lambda:self.move_layer(1))
+        self.layer_down_btn=QPushButton("↓");self.layer_down_btn.setToolTip("Опустить слой ниже");self.layer_down_btn.clicked.connect(lambda:self.move_layer(-1))
+        self.layer_lock_btn=QPushButton("🔒");self.layer_lock_btn.setToolTip("Заблокировать или разблокировать выбранный объект");self.layer_lock_btn.clicked.connect(self.toggle_layer_lock)
+        for button in (self.layer_up_btn,self.layer_down_btn,self.layer_lock_btn):layer_controls.addWidget(button)
+        ll.addLayout(layer_controls)
+        duplicate_button=QPushButton("Дублировать объект");duplicate_button.setToolTip("Создать копию выбранного объекта со всеми его данными (Ctrl+D)");duplicate_button.clicked.connect(self.duplicate_selected_object);ll.addWidget(duplicate_button)
         self.add_buttons = QGridLayout(); self.add_buttons.setContentsMargins(0,0,0,0); self.add_buttons.setHorizontalSpacing(4); self.add_buttons.setVerticalSpacing(4)
         insert_items = [
             ("Текст","text","Текст","T",0,0),("Штрихкод","barcode","123456789","▥",0,1),("QR","qr","https://","⌗",0,2),
@@ -827,6 +1104,7 @@ class MainWindow(QMainWindow):
             self.add_buttons.addWidget(btn,row,col,1,3 if kind=="symbol" else 1)
         ll.addLayout(self.add_buttons)
         self.canvas = LabelCanvas(self.template); self.canvas.selected.connect(self.select_element); self.canvas.moved.connect(self.refresh_properties)
+        self.canvas.elementDoubleClicked.connect(self.edit_element_value)
         self.canvas.moved.connect(self.refresh_print_preview)
         center = QFrame(); center.setObjectName("panel"); cl = QVBoxLayout(center)
         top = QHBoxLayout(); top.addWidget(self.section("ХОЛСТ ЭТИКЕТКИ")); top.addStretch()
@@ -839,7 +1117,7 @@ class MainWindow(QMainWindow):
         zoom_in=QPushButton("+");zoom_in.setToolTip("Увеличить масштаб колесом или кнопкой");zoom_in.clicked.connect(lambda:self.canvas.zoom_by(1.2))
         fit_view=QPushButton("Вписать");fit_view.setToolTip("Вернуть этикетку в центр и вписать в область просмотра");fit_view.clicked.connect(self.canvas.reset_view)
         self.zoom_label=QLabel("100%");self.canvas.zoomChanged.connect(lambda factor:self.zoom_label.setText(f"{factor*100:.0f}%"))
-        self.canvas.setToolTip("Колесо мыши — масштаб · средняя кнопка или Space+перетаскивание — перемещение области просмотра · двойной щелчок — вписать")
+        self.canvas.setToolTip("Колесо мыши — масштаб · средняя кнопка или Space+перетаскивание — перемещение области просмотра · двойной щелчок по объекту — изменить значение, по фону — вписать этикетку")
         top.addWidget(self.grid_btn); top.addWidget(self.guides_btn); top.addWidget(add_v); top.addWidget(add_h);top.addWidget(bg_settings); top.addSpacing(14);top.addWidget(zoom_out);top.addWidget(self.zoom_label);top.addWidget(zoom_in);top.addWidget(fit_view); cl.addLayout(top); cl.addWidget(self.canvas, 1)
         right = QFrame(); right.setObjectName("panel"); rl = QVBoxLayout(right)
         self.label_w = self.num(58, 1, 300); self.label_h = self.num(40, 1, 300); self.grid_size = self.num(1, .1, 20)
@@ -948,11 +1226,15 @@ class MainWindow(QMainWindow):
         self.preview_variant_spin=QSpinBox(); self.preview_variant_spin.setRange(1,1); self.preview_variant_spin.setMaximumWidth(80); self.preview_variant_spin.setToolTip("Выберите этикетку в запланированном тираже.")
         preview_select.addWidget(self.preview_variant_spin); preview_select.addStretch(); preview_layout.addLayout(preview_select)
         self.count_spin.valueChanged.connect(self.update_preview); self.preview_variant_spin.valueChanged.connect(self.update_preview)
+        self.from_spin.valueChanged.connect(self._store_print_range);self.count_spin.valueChanged.connect(self._store_print_range)
         self.setCentralWidget(center)
         self.objects_dock=self._create_dock("Элементы макета",left,"objectsDock")
         self.properties_dock=self._create_dock("Свойства",right,"propertiesDock")
         self.data_dock=self._create_dock("Данные тиража",data_panel,"dataDock")
         self.preview_dock=self._create_dock("Предпросмотр тиража",preview_panel,"previewDock")
+        panels_menu=self.menuBar().addMenu("Панели")
+        panels_menu.addAction(self.data_dock.toggleViewAction())
+        panels_menu.addAction(self.preview_dock.toggleViewAction())
         if self.editor_only:self.data_dock.hide()
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea,self.objects_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,self.properties_dock)
@@ -983,9 +1265,10 @@ class MainWindow(QMainWindow):
         self.resizeDocks([self.data_dock,self.preview_dock],[900,300],Qt.Orientation.Horizontal)
 
     def closeEvent(self,event):
-        self.settings.setValue("dock_state",self.saveState())
-        self.settings.setValue("window_geometry",self.saveGeometry())
-        self.settings.sync()
+        if not self.editor_only:
+            self.settings.setValue("dock_state",self.saveState())
+            self.settings.setValue("window_geometry",self.saveGeometry())
+            self.settings.sync()
         super().closeEvent(event)
 
     def _style(self):
@@ -1030,6 +1313,13 @@ class MainWindow(QMainWindow):
             action = QAction(title, self); action.setShortcut(QKeySequence(key)); action.triggered.connect(lambda _=False, o=orientation: self.add_guide(o)); insert_menu.addAction(action)
         edit_menu = bar.addMenu("Правка")
         delete_action = QAction("Удалить выбранный объект (Delete)", self); delete_action.triggered.connect(self.delete_element); edit_menu.addAction(delete_action)
+        edit_menu.addAction("Поднять слой",self.raise_layer,QKeySequence("Ctrl+Up"))
+        edit_menu.addAction("Опустить слой",self.lower_layer,QKeySequence("Ctrl+Down"))
+        edit_menu.addAction("Заблокировать / разблокировать",self.toggle_layer_lock,QKeySequence("Ctrl+L"))
+        for title,key,callback in (("Копировать объект","Ctrl+C",self.copy_selected_object),("Вставить объект","Ctrl+V",self.paste_copied_object),("Дублировать объект","Ctrl+D",self.duplicate_selected_object)):
+            action=QAction(title,self);action.setShortcut(QKeySequence(key));action.triggered.connect(callback);edit_menu.addAction(action)
+        edit_menu.addSeparator()
+        edit_value_action=QAction("Изменить значение объекта…",self);edit_value_action.triggered.connect(lambda:self.edit_element_value(self.canvas.selected_index));edit_menu.addAction(edit_value_action)
         for title, key, callback in (("Повернуть объект на 90° против часовой", "Ctrl+Alt+Left", self.rotate_element_ccw), ("Повернуть объект на 90° по часовой", "Ctrl+Alt+Right", self.rotate_element_cw)):
             action=QAction(title,self); action.setShortcut(QKeySequence(key)); action.triggered.connect(callback); edit_menu.addAction(action)
         label_menu = bar.addMenu("Этикетка")
@@ -1047,6 +1337,41 @@ class MainWindow(QMainWindow):
         if isinstance(focus,(QLineEdit,QDoubleSpinBox,QSpinBox,QComboBox,QTableWidget)):
             return
         self.delete_element()
+
+    def _object_command_has_text_focus(self):
+        return isinstance(QApplication.focusWidget(),(QLineEdit,QDoubleSpinBox,QSpinBox,QComboBox,QTableWidget))
+
+    def copy_selected_object(self):
+        if self._object_command_has_text_focus():return
+        index=self.canvas.selected_index
+        if 0<=index<len(self.template.elements):
+            self.object_clipboard=Element(**asdict(self.template.elements[index]));self.object_clipboard_paste_count=0
+
+    def paste_copied_object(self):
+        if self._object_command_has_text_focus() or self.object_clipboard is None:return
+        self.object_clipboard_paste_count+=1
+        self._add_object_copy(self.object_clipboard,2.0*self.object_clipboard_paste_count)
+
+    def duplicate_selected_object(self):
+        if self._object_command_has_text_focus():return
+        index=self.canvas.selected_index
+        if 0<=index<len(self.template.elements):self._add_object_copy(self.template.elements[index],2.0)
+
+    def _add_object_copy(self,source,offset):
+        copy=Element(**asdict(source))
+        copy.layer_locked=False
+        copy.x=round(min(max(0,source.x+offset),max(0,self.template.width-source.width)),3)
+        copy.y=round(min(max(0,source.y+offset),max(0,self.template.height-source.height)),3)
+        self.template.elements.append(copy);self.canvas.selected_index=len(self.template.elements)-1
+        self.refresh_object_list();self.select_element(self.canvas.selected_index);self.canvas.update();self.canvas.setFocus();self.refresh_print_preview()
+
+    def edit_element_value(self,index):
+        if not 0<=index<len(self.template.elements):return
+        element=self.template.elements[index]
+        if element.kind not in ("text","symbol","qr","barcode","datamatrix"):return
+        value,accepted=QInputDialog.getText(self,"Изменить значение объекта","Текст, код или переменная:",QLineEdit.EchoMode.Normal,element.value)
+        if accepted:
+            element.value=value;self.canvas.selected_index=index;self.select_element(index);self.canvas.update();self.refresh_print_preview()
 
     def section(self, text):
         label = QLabel(text); label.setStyleSheet(f"font-size:10px; font-weight:700; letter-spacing:1px; color:{MUTED}; padding:7px 0")
@@ -1066,7 +1391,7 @@ class MainWindow(QMainWindow):
         square_code = kind in ("qr", "datamatrix")
         width=14 if square_code else 36 if kind=="barcode" else 8 if kind=="symbol" else 28 if kind=="line" else 18 if kind=="shape" else 30
         height=14 if square_code or kind=="symbol" else 2 if kind=="line" else 14 if kind=="shape" else 18 if kind=="barcode" else 6
-        x,y=self._next_free_position(width,height)
+        x,y=self._view_center_position(width,height)
         el = Element(kind=kind, x=x, y=y, gs1=(kind == "datamatrix"), width=width, height=height, value=value)
         self.template.elements.append(el); self.refresh_object_list(); self.canvas.selected_index = len(self.template.elements)-1; self.canvas.update(); self.select_element(self.canvas.selected_index); self.canvas.setFocus(); self.refresh_print_preview()
 
@@ -1091,10 +1416,16 @@ class MainWindow(QMainWindow):
                 aspect=image.width()/image.height()
             width=min(30.0,22.0*aspect);height=width/aspect
             if height>22.0:height=22.0;width=height*aspect
-            x,y=self._next_free_position(width,height)
+            x,y=self._view_center_position(width,height)
             el=Element(kind=kind,x=x,y=y,width=width,height=height,value=Path(path).name,asset_data=base64.b64encode(raw).decode("ascii"))
             self.template.elements.append(el);self.canvas.selected_index=len(self.template.elements)-1;self.refresh_object_list();self.select_element(self.canvas.selected_index);self.canvas.update();self.refresh_print_preview()
         except Exception as exc:QMessageBox.warning(self,"Не удалось вставить изображение",str(exc))
+
+    def _view_center_position(self,width,height):
+        ox,oy=getattr(self.canvas,"origin",((self.canvas.width()-self.template.width*self.canvas.scale)/2,(self.canvas.height()-self.template.height*self.canvas.scale)/2))
+        center_x=(self.canvas.width()/2-ox)/self.canvas.scale;center_y=(self.canvas.height()/2-oy)/self.canvas.scale
+        x=center_x-width/2;y=center_y-height/2
+        return round(min(max(x,0),max(0,self.template.width-width)),3),round(min(max(y,0),max(0,self.template.height-height)),3)
 
     def _next_free_position(self,width,height):
         margin=2.0; max_x=max(0,self.template.width-width); max_y=max(0,self.template.height-height)
@@ -1116,11 +1447,27 @@ class MainWindow(QMainWindow):
         current = self.canvas.selected_index
         self.object_list.blockSignals(True); self.object_list.clear()
         for index, element in enumerate(self.template.elements):
-            item = QListWidgetItem(f"{index + 1:02d}   {labels.get(element.kind, element.kind)}")
+            lock_mark="🔒 " if element.layer_locked else ""
+            item = QListWidgetItem(f"{index + 1:02d}   {lock_mark}{labels.get(element.kind, element.kind)}")
             item.setToolTip(element.value)
             self.object_list.addItem(item)
         if 0 <= current < self.object_list.count(): self.object_list.setCurrentRow(current)
         self.object_list.blockSignals(False)
+
+    def move_layer(self,delta):
+        index=self.canvas.selected_index;target=index+delta
+        if not (0<=index<len(self.template.elements) and 0<=target<len(self.template.elements)):return
+        self.template.elements[index],self.template.elements[target]=self.template.elements[target],self.template.elements[index]
+        self.canvas.selected_index=target;self.refresh_object_list();self.select_element(target);self.canvas.update();self.refresh_print_preview()
+
+    def raise_layer(self):self.move_layer(1)
+    def lower_layer(self):self.move_layer(-1)
+
+    def toggle_layer_lock(self):
+        element=self.selected_element()
+        if element:
+            element.layer_locked=not element.layer_locked
+            index=self.canvas.selected_index;self.refresh_object_list();self.select_element(index);self.canvas.update()
 
     def select_element(self, index):
         self.canvas.selected_index = index
@@ -1128,12 +1475,19 @@ class MainWindow(QMainWindow):
             self.object_list.blockSignals(True); self.object_list.setCurrentRow(index); self.object_list.blockSignals(False)
         enabled = 0 <= index < len(self.template.elements)
         el = self.template.elements[index] if enabled else None
-        self.align_panel.setEnabled(enabled)
+        movable=enabled and not el.layer_locked
+        self.align_panel.setEnabled(movable)
+        for w in (self.x_spin,self.y_spin,self.w_spin,self.h_spin,self.rotation_spin):w.setEnabled(movable)
+        self.layer_up_btn.setEnabled(enabled and index<len(self.template.elements)-1)
+        self.layer_down_btn.setEnabled(enabled and index>0)
+        self.layer_lock_btn.setEnabled(enabled)
+        self.layer_lock_btn.setText("🔓" if enabled and el.layer_locked else "🔒")
+        self.layer_lock_btn.setToolTip("Разблокировать объект" if enabled and el.layer_locked else "Заблокировать объект")
         asset_selected=enabled and el.kind in ("image","svg")
         text_selected=enabled and el.kind in ("text","symbol"); symbol_selected=enabled and el.kind=="symbol"
         barcode_selected=enabled and el.kind=="barcode"; gs1_selected=enabled and el.kind=="datamatrix"
         vector_selected=enabled and el.kind in ("line","shape"); shape_selected=enabled and el.kind=="shape"
-        for w in (self.x_spin,self.y_spin,self.w_spin,self.h_spin,self.rotation_spin): w.setEnabled(enabled)
+        for w in (self.x_spin,self.y_spin,self.w_spin,self.h_spin,self.rotation_spin): w.setEnabled(movable)
         for w in (self.value_edit,self.variable_button,self.field_combo):w.setEnabled(enabled and not asset_selected)
         if asset_selected:self.value_edit.setToolTip("Имя встроенного файла. Для замены удалите элемент и вставьте изображение заново.")
         else:self.value_edit.setToolTip("Текст или переменная, например {GTIN:Код}")
@@ -1325,7 +1679,7 @@ class MainWindow(QMainWindow):
 
     def align_selected(self, alignment):
         el=self.selected_element()
-        if not el:return
+        if not el or el.layer_locked:return
         angle=math.radians(el.rotation)
         bbox_w=abs(el.width*math.cos(angle))+abs(el.height*math.sin(angle))
         bbox_h=abs(el.width*math.sin(angle))+abs(el.height*math.cos(angle))
@@ -1339,7 +1693,7 @@ class MainWindow(QMainWindow):
 
     def rotate_element(self, degrees):
         el=self.selected_element()
-        if el:
+        if el and not el.layer_locked:
             el.rotation=round((el.rotation + degrees) % 360, 3)
             self.rotation_spin.blockSignals(True); self.rotation_spin.setValue(el.rotation); self.rotation_spin.blockSignals(False)
             self.canvas.update(); self.refresh_print_preview()
@@ -1376,6 +1730,8 @@ class MainWindow(QMainWindow):
     def delete_element(self):
         i=self.canvas.selected_index
         if 0 <= i < len(self.template.elements):
+            if self.template.elements[i].layer_locked:
+                self.status.setText("Сначала разблокируйте объект, чтобы удалить его.");return
             self.template.elements.pop(i); self.canvas.selected_index=min(i,len(self.template.elements)-1); self.refresh_object_list(); self.select_element(self.canvas.selected_index); self.refresh_print_preview()
 
     def set_background(self):
@@ -1512,42 +1868,116 @@ class MainWindow(QMainWindow):
             remainder-=used
         return total
 
+    def validate_print_job(self,ordered):
+        """Return a compact list of print risks for the optional preflight prompt."""
+        issues=set()
+        checked_values=set()
+        for template,row in ordered:
+            for element_index,element in enumerate(template.elements,1):
+                angle=math.radians(element.rotation)
+                bound_w=abs(element.width*math.cos(angle))+abs(element.height*math.sin(angle))
+                bound_h=abs(element.width*math.sin(angle))+abs(element.height*math.cos(angle))
+                center_x=element.x+element.width/2;center_y=element.y+element.height/2
+                if (center_x-bound_w/2 < -0.01 or center_y-bound_h/2 < -0.01 or
+                    center_x+bound_w/2 > template.width+0.01 or center_y+bound_h/2 > template.height+0.01):
+                    issues.add(f"{template.name}: объект {element_index} выходит за границы этикетки.")
+                resolved=self._resolved(element.value,row) if element.kind not in ("image","svg","line","shape") else ""
+                if element.kind in ("text","symbol","qr","barcode","datamatrix"):
+                    for token in re.findall(r"\{([^{}]+)\}",element.value):
+                        if not self._resolved("{"+token+"}",row).strip():
+                            issues.add(f"{template.name}: переменная {{{token}}} пуста в выбранном диапазоне.")
+                    unresolved=re.findall(r"\{([^{}]+)\}",resolved)
+                    for token in unresolved:
+                        issues.add(f"{template.name}: для переменной {{{token}}} нет значения в выбранном диапазоне.")
+                    if element.kind in ("qr","barcode","datamatrix") and not resolved.strip():
+                        issues.add(f"{template.name}: кодовый объект {element_index} содержит пустые данные.")
+                    elif element.kind in ("qr","barcode","datamatrix") and "{" not in resolved:
+                        key=(element.kind,element.barcode_type,resolved,element.gs1)
+                        if key not in checked_values:
+                            checked_values.add(key)
+                            probe=Element(**asdict(element));probe.value=resolved
+                            if self.canvas.code_image(probe) is None:
+                                issues.add(f"{template.name}: данные объекта {element_index} не подходят для выбранного типа кода.")
+                elif element.kind in ("image","svg") and not element.asset_data:
+                    issues.add(f"{template.name}: в объекте {element_index} отсутствует встроенное изображение.")
+        return sorted(issues)
+
     def print_labels(self):
-        start=max(0,self.from_spin.value()-1)
-        selected=self.rows[start:start+self.count_spin.value()] if self.rows else [{} for _ in range(self.count_spin.value())]
-        if not selected:
-            QMessageBox.information(self,"Нет строк","Выбранный диапазон пуст."); return
-        ordered=[]
-        counters={}
-        for index,row in enumerate(selected):
-            identity=self.template_identity_for_print_index(index)
-            template=self.template_for_print_index(index)
-            occurrence=counters.get(identity,0); counters[identity]=occurrence+1
-            numbered=dict(row); number=self.seq_start.value()+occurrence*int(self.seq_direction.currentData()); digits=self.seq_width.value()
-            numbered["_SEQ"]=str(number).zfill(digits) if digits else str(number)
-            ordered.append((template,numbered))
-        if any(abs(t.width-self.template.width)>0.001 or abs(t.height-self.template.height)>0.001 for t,_ in ordered):
-            QMessageBox.warning(self,"Размеры этикеток не совпадают","Все шаблоны в одном задании должны иметь одинаковые ширину и высоту."); return
-        columns=self.label_columns; gap=self.column_gap
-        width=self.template.width*columns+gap*(columns-1)
-        printer=QPrinter(QPrinter.PrinterMode.HighResolution)
-        printer.setDocName(f"{APP} — {len(ordered)} этикеток")
-        printer.setPageSize(QPageSize(QSizeF(width,self.template.height),QPageSize.Unit.Millimeter,"Label layout"))
-        printer.setPageMargins(QMarginsF(0,0,0,0),QPageLayout.Unit.Millimeter); printer.setFullPage(True)
-        dialog=QPrintDialog(printer,self); dialog.setWindowTitle("Выбрать принтер и параметры")
-        if dialog.exec()!=QPrintDialog.DialogCode.Accepted:return
+        available=len(self.rows) if self.rows else max(1,self.count_spin.value())
+        initial_start=int(self.settings.value("print/range_start",self.from_spin.value()))
+        initial_end=int(self.settings.value("print/range_end",min(available,self.from_spin.value()+self.count_spin.value()-1)))
+        initial_copies=int(self.settings.value("print/copies",1))
+        saved_orientation=int(self.settings.value("print/orientation",QPageLayout.Orientation.Portrait.value))
+        continue_sequence=bool(self.settings.value("print/continue_sequence",False))
+        printer=self.print_printer or QPrinter(QPrinter.PrinterMode.HighResolution)
+        saved_name=str(self.settings.value("printer/name",""))
+        if saved_name and printer.printerName()!=saved_name:printer.setPrinterName(saved_name)
+        try:
+            printer.setResolution(int(self.settings.value("printer/resolution",printer.resolution())))
+            printer.setColorMode(QPrinter.ColorMode(int(self.settings.value("printer/color_mode",printer.colorMode().value))))
+            printer.setDuplex(QPrinter.DuplexMode(int(self.settings.value("printer/duplex",printer.duplex().value))))
+            printer.setPaperSource(QPrinter.PaperSource(int(self.settings.value("printer/paper_source",printer.paperSource().value))))
+            printer.setPageOrder(QPrinter.PageOrder(int(self.settings.value("printer/page_order",printer.pageOrder().value))))
+            printer.setCollateCopies(bool(self.settings.value("printer/collate",True)))
+        except (TypeError,ValueError):pass
+        self.print_printer=printer
+
+        def build_order(first,last,copies,continue_seq,reverse):
+            selected=self.rows[first-1:last] if self.rows else [{} for _ in range(first,last+1)]
+            if not selected:raise ValueError("Выбранный диапазон пуст.")
+            ordered=[];range_identity_counts={}
+            for offset in range(len(selected)):
+                identity=self.template_identity_for_print_index(first-1+offset)
+                range_identity_counts[identity]=range_identity_counts.get(identity,0)+1
+            for pass_index in range(copies):
+                for offset,row in enumerate(selected):
+                    absolute_index=first-1+offset
+                    identity=self.template_identity_for_print_index(absolute_index)
+                    template=self.template_for_print_index(absolute_index)
+                    occurrence=self.template_occurrence_before(absolute_index,identity)
+                    if continue_seq:occurrence+=pass_index*range_identity_counts[identity]
+                    numbered=dict(row)
+                    number=self.seq_start.value()+occurrence*int(self.seq_direction.currentData())
+                    digits=self.seq_width.value();numbered["_SEQ"]=str(number).zfill(digits) if digits else str(number)
+                    ordered.append((template,numbered))
+            if reverse:ordered.reverse()
+            if any(abs(t.width-self.template.width)>0.001 or abs(t.height-self.template.height)>0.001 for t,_ in ordered):
+                raise ValueError("Все шаблоны в одном задании должны иметь одинаковую ширину и высоту.")
+            return ordered
+
+        def render_job(device,ordered,columns,width):
+            self._render_print_job(device,ordered,columns,width)
+
+        def send_print_job(device,ordered,columns,width,first,last,copies):
+            device.setDocName(f"{APP} — {len(ordered)} этикеток")
+            try:self._render_print_job(device,ordered,columns,width)
+            except Exception as exc:
+                QMessageBox.critical(self,"Ошибка печати",str(exc));return False
+            self.print_printer=device
+            self.from_spin.setValue(first);self.count_spin.setValue(last-first+1);self.update_preview()
+            self.status.setText(f"В очередь отправлено этикеток: {len(ordered)} · страниц: {(len(ordered)+columns-1)//columns}")
+            return True
+
+        dialog=PrintPreviewDialog(self,printer,available,initial_start,initial_end,initial_copies,
+                                  QPageLayout.Orientation(saved_orientation),continue_sequence,
+                                  build_order,render_job,send_print_job)
+        dialog.exec()
+
+    def _render_print_job(self,printer,ordered,columns,width):
         painter=QPainter()
-        if not painter.begin(printer):
-            QMessageBox.critical(self,"Ошибка печати","Не удалось открыть драйвер принтера."); return
+        if not painter.begin(printer):raise RuntimeError("Не удалось открыть драйвер принтера.")
         try:
             for i,(template,row) in enumerate(ordered):
                 if i and i%columns==0 and not printer.newPage():raise RuntimeError("Драйвер не смог добавить следующую строку этикеток.")
-                page=QRectF(painter.viewport()); cell_w=page.width()*self.template.width/width; gap_px=page.width()*gap/width
+                page=QRectF(painter.viewport()); cell_w=page.width()*self.template.width/width; gap_px=page.width()*self.column_gap/width
                 col=i%columns; cell=QRectF(col*(cell_w+gap_px),page.top(),cell_w,page.height())
                 self._paint_label(painter,row,cell,template)
-        except Exception as exc:QMessageBox.critical(self,"Ошибка задания печати",str(exc))
-        else:self.status.setText(f"В очередь отправлено этикеток: {len(ordered)}")
         finally:painter.end()
+
+    def _store_print_range(self,*_):
+        if not hasattr(self,"from_spin") or not self.from_spin.isEnabled():return
+        first=max(1,self.from_spin.value());last=min(len(self.rows),first+self.count_spin.value()-1) if self.rows else first+self.count_spin.value()-1
+        self.settings.setValue("print/range_start",first);self.settings.setValue("print/range_end",max(first,last))
 
     def configure_composition(self):
         dialog=QDialog(self); dialog.setWindowTitle("Шаблоны тиража"); dialog.resize(700,500); dialog.setMinimumSize(630,440)
