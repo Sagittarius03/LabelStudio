@@ -382,13 +382,14 @@ class PrintPreviewDialog(QDialog):
         requested_layout=QPageLayout(page_size,page_orientation,QMarginsF(0,0,0,0),QPageLayout.Unit.Millimeter)
         accepted=self.printer.setPageLayout(requested_layout)
         effective=self.printer.pageLayout().fullRect(QPageLayout.Unit.Millimeter)
+        self.effective_page_width=effective.width();self.effective_page_height=effective.height()
         self.media_layout_applied=accepted and abs(effective.width()-self.page_width)<.05 and abs(effective.height()-label_h)<.05
         self.printer.setFullPage(True)
         self.printer.setCopyCount(1)  # Copies are expanded into the page sequence by the app.
         if self.media_layout_applied:
             self.columns_label.setText(f"Формат задания: {self.page_width:.2f} × {label_h:.2f} мм · {self.columns} колонок · зазор {self.gap:.2f} мм")
         else:
-            self.columns_label.setText(f"Драйвер не принял формат {self.page_width:.2f} × {label_h:.2f} мм. Проверьте размер носителя в настройках принтера.")
+            self.columns_label.setText(f"Нужен формат {self.page_width:.2f} × {label_h:.2f} мм · драйвер оставил {effective.width():.2f} × {effective.height():.2f} мм")
 
     @staticmethod
     def _page_layout_config(printer):
@@ -455,7 +456,17 @@ class PrintPreviewDialog(QDialog):
         printer_config={"name":self.printer.printerName(),"resolution":self.printer.resolution(),
                         "color_mode":self.printer.colorMode().value,"duplex":self.printer.duplex().value,
                         "paper_source":self.printer.paperSource().value,"page_order":self.printer.pageOrder().value,
-                        "collate":self.printer.collateCopies(),"page_layout":self._page_layout_config(self.printer)}
+                        "collate":self.printer.collateCopies(),
+                        "requested_media":{"width_mm":getattr(self,"page_width",self.owner.template.width),
+                                           "height_mm":getattr(self,"page_height",self.owner.template.height),
+                                           "orientation_degrees":getattr(self,"rotation",0)}}
+        previous=self.owner.template.print_settings.get("printer",{})
+        if getattr(self,"media_layout_applied",False):
+            printer_config["page_layout"]=self._page_layout_config(self.printer)
+        elif previous.get("page_layout"):
+            # A rejected layout is the driver's old paper stock; do not replace
+            # the saved template media with that stale size.
+            printer_config["page_layout"]=previous["page_layout"]
         settings.setValue("printer/name",printer_config["name"]);settings.setValue("printer/resolution",printer_config["resolution"])
         settings.setValue("printer/color_mode",printer_config["color_mode"]);settings.setValue("printer/duplex",printer_config["duplex"])
         settings.setValue("printer/paper_source",printer_config["paper_source"]);settings.setValue("printer/page_order",printer_config["page_order"])
@@ -493,11 +504,6 @@ class PrintPreviewDialog(QDialog):
                 message+="\n\nПродолжить печать?"
                 if QMessageBox.question(self,"Проверка перед печатью",message,QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
         self._save_printer_settings();self._configure_page()
-        if not self.media_layout_applied:
-            QMessageBox.warning(self,"Формат страницы не принят",
-                                f"Не удалось передать принтеру формат {self.page_width:.2f} × {self.page_height:.2f} мм. "
-                                "Откройте «Настройки принтера…», выберите или создайте такой носитель и повторите печать.")
-            return
         try:
             if not self.print_callback(self.printer,self.ordered,self.columns,self.page_width,self.rotation,
                                        self.start_spin.value(),self.end_spin.value(),self.copies_spin.value()):return
@@ -1509,6 +1515,7 @@ class MainWindow(QMainWindow):
         self.variable_button=QToolButton(); self.variable_button.setText("Переменная ▾"); self.variable_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup); self.variable_menu=QMenu(self.variable_button); self.variable_button.setMenu(self.variable_menu)
         self.field_combo = QComboBox(); self.field_combo.addItem("Вручную", ""); self.field_combo.addItem("Нумерация тиража", "SEQ")
         self.x_spin = self.num(3, 0, 300); self.y_spin = self.num(3, 0, 300); self.w_spin = self.num(30, .1, 300); self.h_spin = self.num(8, .1, 300); self.font_spin = self.num(10, 1, 96)
+        self.font_spin.setDecimals(0); self.font_spin.setSingleStep(1)
         self.letter_spacing_spin=self.num(0,-5,30);self.letter_spacing_spin.setDecimals(2);self.letter_spacing_spin.setSingleStep(.25);self.letter_spacing_spin.setSuffix(" pt")
         self.letter_spacing_spin.setToolTip("Положительное значение раздвигает буквы, отрицательное сближает.")
         self.line_spacing_spin=self.num(0,-5,30);self.line_spacing_spin.setDecimals(2);self.line_spacing_spin.setSingleStep(.25);self.line_spacing_spin.setSuffix(" pt")
@@ -1983,7 +1990,9 @@ class MainWindow(QMainWindow):
             for index,line in enumerate(lines):
                 x=base_x+(line["x"]-bounds.left())*mm_per_point;y=base_y+(line["y"]-bounds.top())*mm_per_point
                 width=max(2,line["width"]*mm_per_point+1);height=max(2,line["height"]*mm_per_point+1)
-                additions.append(Element(kind="text",x=round(x,3),y=round(y,3),width=round(width,3),height=round(height,3),value=line["text"],font_size=max(3,line["height"]*.9),bold=index==0))
+                font_size=max(3,round(line["height"]*.9))
+                height=max(height,font_size*25.4/72*1.4)
+                additions.append(Element(kind="text",x=round(x,3),y=round(y,3),width=round(width,3),height=round(height,3),value=line["text"],font_size=font_size,bold=index==0))
             if code_rect and code_value:
                 size=code_rect.width()*mm_per_point
                 additions.append(Element(kind="datamatrix",x=round(base_x+(code_rect.x()-bounds.left())*mm_per_point,3),y=round(base_y+(code_rect.y()-bounds.top())*mm_per_point,3),width=round(size,3),height=round(size,3),value=code_value,gs1=True))
@@ -2534,7 +2543,9 @@ class MainWindow(QMainWindow):
             for index,line in enumerate(descriptors):
                 x=max(0,line["x"]*sx);y=max(0,line["y"]*sy)
                 element_width=max(4,width_mm-x-.7);element_height=max(2,line["height"]*sy+1.1)
-                template.elements.append(Element(kind="text",x=round(x,3),y=round(y,3),width=round(element_width,3),height=round(element_height,3),value="{"+line["key"]+"}",font_size=max(3,line["height"]*.92),bold=index==0))
+                font_size=max(3,round(line["height"]*.92))
+                element_height=max(element_height,font_size*25.4/72*1.4)
+                template.elements.append(Element(kind="text",x=round(x,3),y=round(y,3),width=round(element_width,3),height=round(element_height,3),value="{"+line["key"]+"}",font_size=font_size,bold=index==0))
             if has_code:
                 code_line=next((line for line in reference if re.search(r"01\d{14}21",line["text"])),None)
                 if code_line:
@@ -2677,7 +2688,14 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _template_from_data(data):
-        return LabelTemplate(name=data.get("name","Шаблон"),width=float(data.get("width",58)),height=float(data.get("height",40)),background=data.get("background","#ffffff"),background_image=data.get("background_image",""),background_image_opacity=float(data.get("background_image_opacity",.35)),background_image_visible=bool(data.get("background_image_visible",True)),background_image_fit=data.get("background_image_fit","stretch"),grid=float(data.get("grid",1)),guides=data.get("guides",[]),elements=[Element(**e) for e in data.get("elements",[])],print_settings=data.get("print_settings",{}))
+        elements=[]
+        for raw in data.get("elements",[]):
+            item=dict(raw)
+            if item.get("kind","text") in ("text","symbol"):
+                try:item["font_size"]=max(1,int(round(float(item.get("font_size",10)))))
+                except (TypeError,ValueError):item["font_size"]=10
+            elements.append(Element(**item))
+        return LabelTemplate(name=data.get("name","Шаблон"),width=float(data.get("width",58)),height=float(data.get("height",40)),background=data.get("background","#ffffff"),background_image=data.get("background_image",""),background_image_opacity=float(data.get("background_image_opacity",.35)),background_image_visible=bool(data.get("background_image_visible",True)),background_image_fit=data.get("background_image_fit","stretch"),grid=float(data.get("grid",1)),guides=data.get("guides",[]),elements=elements,print_settings=data.get("print_settings",{}))
 
     def template_identity_for_print_index(self,index):
         blocks=[(b.path or "__current__",max(1,int(b.copies))) for b in self.composition_blocks] or [("__current__",1)]
