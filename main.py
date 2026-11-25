@@ -375,10 +375,10 @@ class PrintPreviewDialog(QDialog):
         label_h=self.owner.template.width if self.rotation in (90,270) else self.owner.template.height
         self.page_width=label_w*self.columns+self.gap*(self.columns-1)
         self.page_height=label_h
-        # QPageSize is portrait-oriented. Define the short edge first, then ask
-        # QPageLayout to rotate it for wide labels; passing 58x40 as Portrait
-        # makes Windows label drivers apply the wrong feed direction.
-        landscape=self.page_width>label_h
+        # The driver's orientation follows the user's choice, not the label's
+        # aspect ratio. QPageSize is stored in portrait coordinates, so only a
+        # requested 90°/270° rotation swaps the base dimensions for Qt.
+        landscape=self.rotation in (90,270)
         base_width,base_height=(label_h,self.page_width) if landscape else (self.page_width,label_h)
         page_size=QPageSize(QSizeF(base_width,base_height),QPageSize.Unit.Millimeter,
                              "Label template",QPageSize.SizeMatchPolicy.ExactMatch)
