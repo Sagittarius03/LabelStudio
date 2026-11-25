@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QSize, QSizeF, QRectF, QPointF, Signal, QMarginsF, QSettings, QByteArray, QBuffer, QIODevice, QTimer
+from PySide6.QtCore import Qt, QSize, QSizeF, QRect, QRectF, QPointF, Signal, QMarginsF, QSettings, QByteArray, QBuffer, QIODevice, QTimer
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QPageSize, QPageLayout, QAction, QKeySequence, QShortcut, QIcon, QTextLayout, QTextOption
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtPdf import QPdfDocument
@@ -66,14 +66,16 @@ class Element:
 
 
 def draw_text_layout(painter: QPainter, element: Element, rect: QRectF, text: str):
-    """Draw text from explicit glyph positions so screen and printer metrics match."""
+    """Lay out text consistently and apply optional tracking/leading."""
     font=QFont(element.font_family)
     font.setPixelSize(max(1,round(element.font_size*25.4/72)))
-    font.setBold(element.bold);font.setItalic(element.italic);font.setUnderline(False)
+    font.setBold(element.bold);font.setItalic(element.italic);font.setUnderline(element.underline)
+    font.setStyleStrategy(QFont.StyleStrategy.ForceOutline)
     font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing,element.letter_spacing_pt*25.4/72)
     layout=QTextLayout(str(text or ""),font)
     option=QTextOption()
     option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+    option.setUseDesignMetrics(True)
     horizontal="center" if element.kind=="symbol" else element.horizontal_alignment
     option.setAlignment({"left":Qt.AlignmentFlag.AlignLeft,"center":Qt.AlignmentFlag.AlignHCenter,
                          "right":Qt.AlignmentFlag.AlignRight}.get(horizontal,Qt.AlignmentFlag.AlignLeft))
@@ -90,21 +92,8 @@ def draw_text_layout(painter: QPainter, element: Element, rect: QRectF, text: st
     vertical="center" if element.kind=="symbol" else element.vertical_alignment
     vertical_offset={"top":0.0,"center":(rect.height()-total_height)/2,
                      "bottom":rect.height()-total_height}.get(vertical,(rect.height()-total_height)/2)
-    painter.save();painter.setClipRect(rect);color=QColor(element.color)
-    for line_index,line in enumerate(lines):
-        offset_y=vertical_offset+line_index*line_gap
-        for run in layout.glyphRuns(line.textStart(),line.textLength()):
-            raw_font=run.rawFont()
-            for glyph,position in zip(run.glyphIndexes(),run.positions()):
-                path=raw_font.pathForGlyph(glyph)
-                path.translate(rect.left()+position.x(),rect.top()+position.y()+offset_y)
-                painter.fillPath(path,color)
-        if element.underline:
-            baseline=rect.top()+line.position().y()+line.ascent()+offset_y
-            underline_y=baseline+max(0.08,line.descent()*.25)
-            painter.setPen(QPen(color,max(.08,font.pixelSize()*.045)))
-            painter.drawLine(QPointF(rect.left()+line.position().x(),underline_y),
-                             QPointF(rect.left()+line.position().x()+line.naturalTextWidth(),underline_y))
+    painter.save();painter.setClipRect(rect);painter.setPen(QColor(element.color))
+    layout.draw(painter,QPointF(rect.left(),rect.top()+vertical_offset))
     painter.restore()
 
 
@@ -2800,13 +2789,15 @@ class MainWindow(QMainWindow):
         painter=QPainter()
         if not painter.begin(printer):raise RuntimeError("Не удалось открыть драйвер принтера.")
         try:
-            # Render in physical millimeters. The old viewport-width ratio silently
-            # scaled a 58 mm label down when a driver exposed a 55.5 mm drawable area.
-            scale=printer.resolution()/25.4
-            painter.scale(scale,scale)
             label_width=ordered[0][0].width if ordered else self.template.width
             label_height=ordered[0][0].height if ordered else self.template.height
             page_width=label_width*columns+self.column_gap*(columns-1)
+            # Map the app's mm coordinate space onto the requested full media page;
+            # printer printable-area offsets must not shift or crop the artwork.
+            viewport=printer.pageLayout().fullRectPixels(printer.resolution())
+            painter.setViewport(viewport)
+            painter.setWindow(QRect(0,0,max(1,round(page_width*1000)),max(1,round(label_height*1000))))
+            painter.scale(1000,1000)
             for i,(template,row) in enumerate(ordered):
                 if i and i%columns==0 and not printer.newPage():raise RuntimeError("Драйвер не смог добавить следующую строку этикеток.")
                 col=i%columns; cell=QRectF(col*(label_width+self.column_gap),0,label_width,label_height)
