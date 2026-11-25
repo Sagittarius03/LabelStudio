@@ -362,11 +362,15 @@ class PrintPreviewDialog(QDialog):
         label_w=self.owner.template.height if self.rotation in (90,270) else self.owner.template.width
         label_h=self.owner.template.width if self.rotation in (90,270) else self.owner.template.height
         self.page_width=label_w*self.columns+self.gap*(self.columns-1)
-        # The template defines the physical label size. Keep the printer's driver
-        # options, but set the job page to the exact label/ribbon geometry.
-        page_size=QPageSize(QSizeF(self.page_width,label_h),QPageSize.Unit.Millimeter,
+        # QPageSize is portrait-oriented. Define the short edge first, then ask
+        # QPageLayout to rotate it for wide labels; passing 58x40 as Portrait
+        # makes Windows label drivers apply the wrong feed direction.
+        landscape=self.page_width>label_h
+        base_width,base_height=(label_h,self.page_width) if landscape else (self.page_width,label_h)
+        page_size=QPageSize(QSizeF(base_width,base_height),QPageSize.Unit.Millimeter,
                              "Label template",QPageSize.SizeMatchPolicy.ExactMatch)
-        self.printer.setPageLayout(QPageLayout(page_size,QPageLayout.Orientation.Portrait,
+        page_orientation=QPageLayout.Orientation.Landscape if landscape else QPageLayout.Orientation.Portrait
+        self.printer.setPageLayout(QPageLayout(page_size,page_orientation,
                                                QMarginsF(0,0,0,0),QPageLayout.Unit.Millimeter))
         self.printer.setFullPage(True)
         self.printer.setCopyCount(1)  # Copies are expanded into the page sequence by the app.
