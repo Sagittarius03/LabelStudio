@@ -199,7 +199,7 @@ class PrintPreviewDialog(QDialog):
             QLabel#title { color:white; font-size:20px; font-weight:700; }
             QLabel#section { color:#344054; font-size:13px; font-weight:700; }
             QLabel#hint { color:#667085; font-size:11px; }
-            QComboBox,QSpinBox { color:#202a39; background:white; border:1px solid #cbd5e1; border-radius:6px; padding:7px; min-height:24px; }
+            QComboBox,QSpinBox,QDoubleSpinBox { color:#202a39; background:white; border:1px solid #cbd5e1; border-radius:6px; padding:7px; min-height:24px; }
             QCheckBox { color:#344054; spacing:8px; }
             QPushButton { color:#263447; background:#ffffff; border:1px solid #cbd5e1; border-radius:6px; padding:8px 11px; }
             QPushButton:hover { background:#f0f5ff; border-color:#8aafff; }
@@ -243,6 +243,10 @@ class PrintPreviewDialog(QDialog):
         self.advanced_panel=QFrame();advanced_layout=QVBoxLayout(self.advanced_panel);advanced_layout.setContentsMargins(4,0,4,0)
         self.continue_check=QCheckBox("Продолжать {SEQ} между копиями диапазона");self.continue_check.setChecked(continue_sequence);advanced_layout.addWidget(self.continue_check)
         self.reverse_check=QCheckBox("Печатать диапазон в обратном порядке");advanced_layout.addWidget(self.reverse_check)
+        correction_row=QHBoxLayout();correction_row.addWidget(QLabel("Поправка ширины носителя"))
+        self.width_correction_spin=QDoubleSpinBox();self.width_correction_spin.setRange(-10,10);self.width_correction_spin.setDecimals(1);self.width_correction_spin.setSingleStep(.1);self.width_correction_spin.setSuffix(" мм")
+        self.width_correction_spin.setToolTip("Прибавляется к ширине носителя, передаваемой драйверу. Значение сохраняется отдельно для каждого принтера.")
+        correction_row.addWidget(self.width_correction_spin);advanced_layout.addLayout(correction_row)
         self.columns_label=QLabel();self.columns_label.setObjectName("hint");advanced_layout.addWidget(self.columns_label)
         self.columns_button=QPushButton("Настроить колонки ленты…");advanced_layout.addWidget(self.columns_button);self.advanced_panel.hide();left_layout.addWidget(self.advanced_panel)
         left_layout.addStretch()
@@ -273,6 +277,7 @@ class PrintPreviewDialog(QDialog):
         self.copies_spin.valueChanged.connect(self._refresh_job)
         self.orientation_combo.currentIndexChanged.connect(self._refresh_job)
         self.continue_check.toggled.connect(self._refresh_job);self.reverse_check.toggled.connect(self._refresh_job)
+        self.width_correction_spin.valueChanged.connect(self._width_correction_changed)
         self.columns_button.clicked.connect(self._configure_columns)
         self.preview.paintRequested.connect(self._paint_preview);self.preview.previewChanged.connect(self._sync_pages)
         self.page_spin.valueChanged.connect(self.preview.setCurrentPage)
@@ -296,11 +301,27 @@ class PrintPreviewDialog(QDialog):
     def _printer_changed(self,*_):
         name=str(self.printer_combo.currentData() or "").strip()
         if name and self.printer.printerName()!=name:self.printer.setPrinterName(name)
+        self._load_width_correction(name)
         if name:
             self.owner.settings.setValue("printer/name",name)
             self.owner.settings.sync()
             self.owner.template.print_settings.setdefault("printer",{})["name"]=name
-            self._save_printer_settings()
+        self._refresh_job()
+        if name:self._save_printer_settings()
+
+    def _width_correction_key(self,printer_name):
+        identity=hashlib.sha1((str(printer_name).casefold() or "default").encode("utf-8")).hexdigest()
+        return f"printer/width_correction/{identity}"
+
+    def _load_width_correction(self,printer_name):
+        key=self._width_correction_key(printer_name)
+        default=2.5 if "gx43i" in str(printer_name).casefold() else 0.0
+        value=float(self.owner.settings.value(key,default))
+        self.width_correction_spin.blockSignals(True);self.width_correction_spin.setValue(value);self.width_correction_spin.blockSignals(False)
+
+    def _width_correction_changed(self,value):
+        name=str(self.printer_combo.currentData() or "")
+        self.owner.settings.setValue(self._width_correction_key(name),float(value));self.owner.settings.sync()
         self._refresh_job()
 
     def _profiles(self):
@@ -339,6 +360,7 @@ class PrintPreviewDialog(QDialog):
             if combo_index<0:self.printer_combo.addItem(printer_name,printer_name);combo_index=self.printer_combo.findData(printer_name)
             self.printer_combo.blockSignals(True);self.printer_combo.setCurrentIndex(combo_index);self.printer_combo.blockSignals(False)
             self.printer.setPrinterName(printer_name)
+            self._load_width_correction(printer_name)
         try:
             if "resolution" in profile:self.printer.setResolution(int(profile["resolution"]))
             if "color_mode" in profile:self.printer.setColorMode(QPrinter.ColorMode(int(profile["color_mode"])))
@@ -375,11 +397,13 @@ class PrintPreviewDialog(QDialog):
         label_h=self.owner.template.width if self.rotation in (90,270) else self.owner.template.height
         self.page_width=label_w*self.columns+self.gap*(self.columns-1)
         self.page_height=label_h
+        width_correction=self.width_correction_spin.value()
+        self.driver_page_width=self.page_width+width_correction
         # The driver's orientation follows the user's choice, not the label's
         # aspect ratio. QPageSize is stored in portrait coordinates, so only a
         # requested 90°/270° rotation swaps the base dimensions for Qt.
         landscape=self.rotation in (90,270)
-        base_width,base_height=(label_h,self.page_width) if landscape else (self.page_width,label_h)
+        base_width,base_height=(label_h,self.driver_page_width) if landscape else (self.driver_page_width,label_h)
         page_size=QPageSize(QSizeF(base_width,base_height),QPageSize.Unit.Millimeter,
                              "Label template",QPageSize.SizeMatchPolicy.ExactMatch)
         page_orientation=QPageLayout.Orientation.Landscape if landscape else QPageLayout.Orientation.Portrait
@@ -392,12 +416,16 @@ class PrintPreviewDialog(QDialog):
         orientation_accepted=self.printer.setPageOrientation(page_orientation)
         effective=self.printer.pageLayout().fullRect(QPageLayout.Unit.Millimeter)
         self.effective_page_width=effective.width();self.effective_page_height=effective.height()
-        self.media_layout_applied=size_accepted and orientation_accepted and abs(effective.width()-self.page_width)<.05 and abs(effective.height()-label_h)<.05
+        expected_effective=(self.page_width,label_h+width_correction) if landscape else (self.driver_page_width,label_h)
+        self.media_layout_applied=(size_accepted and orientation_accepted and
+                                   abs(effective.width()-expected_effective[0])<.05 and
+                                   abs(effective.height()-expected_effective[1])<.05)
         self.printer.setCopyCount(1)  # Copies are expanded into the page sequence by the app.
         if self.media_layout_applied:
-            self.columns_label.setText(f"Формат задания: {self.page_width:.2f} × {label_h:.2f} мм · {self.columns} колонок · зазор {self.gap:.2f} мм")
+            correction_note=f" · коррекция ширины {width_correction:+.1f} мм" if abs(width_correction)>.001 else ""
+            self.columns_label.setText(f"Формат задания: {self.driver_page_width:.2f} × {self.page_height:.2f} мм · {self.columns} колонок · зазор {self.gap:.2f} мм{correction_note}")
         else:
-            self.columns_label.setText(f"Нужен формат {self.page_width:.2f} × {label_h:.2f} мм · драйвер оставил {effective.width():.2f} × {effective.height():.2f} мм")
+            self.columns_label.setText(f"Шаблон {self.page_width:.2f} × {label_h:.2f} мм; драйверу передано {self.driver_page_width:.2f} мм по ширине · драйвер сообщает {effective.width():.2f} × {effective.height():.2f} мм")
 
     @staticmethod
     def _page_layout_config(printer):
@@ -429,8 +457,9 @@ class PrintPreviewDialog(QDialog):
         self.ordered=self.build_order(self.start_spin.value(),self.end_spin.value(),self.copies_spin.value(),self.continue_check.isChecked(),self.reverse_check.isChecked())
         self._configure_page()
         pages=max(1,(len(self.ordered)+self.columns-1)//self.columns)
-        page_status=(f"Формат задания: {self.page_width:.2f} × {self.page_height:.2f} мм" if self.media_layout_applied else
-                     f"Запрошено из шаблона: {self.page_width:.2f} × {self.page_height:.2f} мм · драйвер сообщает: {self.effective_page_width:.2f} × {self.effective_page_height:.2f} мм")
+        correction_note=f" · поправка {self.width_correction_spin.value():+.1f} мм" if abs(self.width_correction_spin.value())>.001 else ""
+        page_status=(f"Шаблон {self.page_width:.2f} × {self.page_height:.2f} мм · драйверу: {self.driver_page_width:.2f} мм по ширине{correction_note}" if self.media_layout_applied else
+                     f"Шаблон {self.page_width:.2f} × {self.page_height:.2f} мм · драйверу: {self.driver_page_width:.2f} мм по ширине{correction_note} · сообщает: {self.effective_page_width:.2f} × {self.effective_page_height:.2f} мм")
         self.summary.setText(f"Этикеток: {len(self.ordered)}    Страниц: {pages}\nВарианты: {self.start_spin.value()}–{self.end_spin.value()} · копий диапазона: {self.copies_spin.value()}\n{page_status}")
         self.variation_label.setText(f"{self.available} вариантов доступно")
         self.preview.updatePreview();self._sync_pages()
@@ -445,7 +474,14 @@ class PrintPreviewDialog(QDialog):
         saved=int(self.owner.template.print_settings.get("orientation",0))
         if saved==QPageLayout.Orientation.Landscape.value:saved=90
         index=self.orientation_combo.findData(saved)
-        if index>=0:self.orientation_combo.setCurrentIndex(index)
+        saved_orientation=profile.get("orientation")
+        if saved_orientation is not None:
+            try:
+                saved_orientation=int(saved_orientation)
+                if saved_orientation==QPageLayout.Orientation.Landscape.value:saved_orientation=90
+                orientation_index=self.orientation_combo.findData(saved_orientation)
+                if orientation_index>=0:self.orientation_combo.setCurrentIndex(orientation_index)
+            except (TypeError,ValueError):pass
         self._refresh_job()
 
     def _open_printer_settings(self):
@@ -458,7 +494,7 @@ class PrintPreviewDialog(QDialog):
             index=self.printer_combo.findData(actual)
             if index<0:self.printer_combo.addItem(actual,actual);index=self.printer_combo.findData(actual)
             self.printer_combo.blockSignals(True);self.printer_combo.setCurrentIndex(index);self.printer_combo.blockSignals(False)
-            self._save_printer_settings();self._refresh_job()
+            self._load_width_correction(actual);self._refresh_job();self._save_printer_settings()
 
     def _save_printer_settings(self):
         settings=self.owner.settings
@@ -468,6 +504,8 @@ class PrintPreviewDialog(QDialog):
                         "collate":self.printer.collateCopies(),
                         "requested_media":{"width_mm":getattr(self,"page_width",self.owner.template.width),
                                            "height_mm":getattr(self,"page_height",self.owner.template.height),
+                                           "driver_width_mm":getattr(self,"driver_page_width",self.owner.template.width),
+                                           "width_correction_mm":self.width_correction_spin.value(),
                                            "orientation_degrees":getattr(self,"rotation",0)}}
         previous=self.owner.template.print_settings.get("printer",{})
         if getattr(self,"media_layout_applied",False):
@@ -1425,6 +1463,7 @@ class MainWindow(QMainWindow):
         else:
             self.data_dock.setVisible(True)
             self.preview_dock.setVisible(True)
+        self._sync_data_dock_floating(self.data_dock.isFloating())
 
     def _build_ui(self):
         toolbar = QToolBar(); toolbar.setObjectName("mainToolbar"); toolbar.setMovable(False); toolbar.setIconSize(QSizeF(18, 18).toSize()); self.addToolBar(toolbar)
@@ -1601,6 +1640,9 @@ class MainWindow(QMainWindow):
         data_layout=QVBoxLayout(data_panel); data_layout.setContentsMargins(10,8,10,8); data_layout.setSpacing(8)
         data_content=QWidget(); data_content.setMinimumWidth(570); dl=QVBoxLayout(data_content); dl.setContentsMargins(0,0,0,0)
         data_head = QHBoxLayout(); data_head.addWidget(self.section("ИСТОЧНИК ДАННЫХ И ТИРАЖ")); data_head.addStretch()
+        self.table_float_button=QPushButton("↗ Таблица отдельно");self.table_float_button.setCheckable(True)
+        self.table_float_button.setToolTip("Показать таблицу данных отдельным плавающим окном")
+        data_head.addWidget(self.table_float_button)
         self.file_label = QLabel("Файл не выбран"); self.file_label.setStyleSheet(f"color:{MUTED}")
         load_btn = QPushButton("Импорт CSV / XLSX"); load_btn.setIcon(self.glyph_icon("↥")); load_btn.clicked.connect(self.load_data)
         pdf_load_btn=QPushButton("Этикетки из PDF…");pdf_load_btn.setToolTip("Распознать этикетки на страницах PDF, создать поля шаблона и загрузить вариации тиража");pdf_load_btn.clicked.connect(self.import_pdf_labels)
@@ -1640,6 +1682,8 @@ class MainWindow(QMainWindow):
         self.preview_dock=self._create_dock("Предпросмотр тиража",preview_panel,"previewDock")
         panels_menu=self.menuBar().addMenu("Панели")
         panels_menu.addAction(self.data_dock.toggleViewAction())
+        self.table_float_action=QAction("Таблица данных отдельным окном",self);self.table_float_action.setCheckable(True)
+        panels_menu.addAction(self.table_float_action)
         panels_menu.addAction(self.preview_dock.toggleViewAction())
         if self.editor_only:self.data_dock.hide()
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea,self.objects_dock)
@@ -1647,6 +1691,9 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea,self.data_dock)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea,self.preview_dock)
         self.splitDockWidget(self.data_dock,self.preview_dock,Qt.Orientation.Horizontal)
+        self.table_float_button.toggled.connect(self.set_data_dock_floating)
+        self.table_float_action.toggled.connect(self.set_data_dock_floating)
+        self.data_dock.topLevelChanged.connect(self._sync_data_dock_floating)
         self.resizeDocks([self.objects_dock,self.properties_dock],[300,350],Qt.Orientation.Horizontal)
         self.resizeDocks([self.data_dock,self.preview_dock],[240,240],Qt.Orientation.Vertical)
         self.resizeDocks([self.data_dock,self.preview_dock],[900,300],Qt.Orientation.Horizontal)
@@ -1659,6 +1706,26 @@ class MainWindow(QMainWindow):
         dock.setAllowedAreas(Qt.DockWidgetArea.AllDockWidgetAreas)
         dock.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
         return dock
+
+    def set_data_dock_floating(self,floating):
+        floating=bool(floating)
+        if self.data_dock.isFloating()!=floating:self.data_dock.setFloating(floating)
+        if floating:
+            self.table.setMaximumHeight(16777215)
+            self.data_dock.resize(1200,650)
+            self.data_dock.show();self.data_dock.raise_();self.data_dock.activateWindow()
+        else:
+            self.table.setMaximumHeight(180)
+            self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea,self.data_dock)
+            self.data_dock.show()
+        self._sync_data_dock_floating(floating)
+
+    def _sync_data_dock_floating(self,floating):
+        floating=bool(floating)
+        if not hasattr(self,"table_float_button"):return
+        self.table.setMaximumHeight(16777215 if floating else 180)
+        self.table_float_button.blockSignals(True);self.table_float_button.setChecked(floating);self.table_float_button.blockSignals(False)
+        self.table_float_action.blockSignals(True);self.table_float_action.setChecked(floating);self.table_float_action.blockSignals(False)
 
     def _connect_canvas(self,canvas):
         canvas.selectionChanged.connect(self.select_elements)
@@ -1784,6 +1851,8 @@ class MainWindow(QMainWindow):
             self.activate_document(target)
 
     def restore_default_docks(self):
+        self.set_data_dock_floating(False)
+        if self.editor_only:self.data_dock.hide()
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea,self.objects_dock)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea,self.properties_dock)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea,self.data_dock)
