@@ -4,18 +4,23 @@
 
 ## Запуск для разработки
 
-Требуется Python 3.11+ и [uv](https://docs.astral.sh/uv/).
+Требуется Python 3.11+ и [uv](https://docs.astral.sh/uv/). На Linux Mint:
 
-```powershell
+```bash
 uv sync
 uv run main.py
 ```
+
+`uv sync` автоматически устанавливает ZXing вместе с остальными зависимостями проекта. Запускайте программу через `uv run`, чтобы использовалось созданное окружение.
+
+`zxing-cpp` используется для чтения QR, DataMatrix и линейных штрихкодов из PDF. Остальные графические элементы сохраняются как изображение.
 
 `uv sync` создаёт `.venv` и ставит зависимости по `uv.lock`. Для локальной сборки Windows приложения:
 
 ```powershell
 uv sync --group build
-uv run pyinstaller --noconfirm --clean --windowed --name LabelStudio --icon assets/labelstudio.ico --add-data "logodeveloper.svg;." --add-data "assets;assets" --collect-all pystrich --collect-all qrcode --collect-all barcode main.py
+uv run python -c "import zxingcpp; print(zxingcpp.__file__)"
+uv run pyinstaller --noconfirm --clean --windowed --name LabelStudio --icon assets/labelstudio.ico --add-data "logodeveloper.svg;." --add-data "assets;assets" --hidden-import zxingcpp --collect-all pystrich --collect-all qrcode --collect-all barcode --collect-all zxingcpp main.py
 ```
 
 GitHub Actions собирает Windows portable EXE и установщик Inno Setup при создании тега `v*`.

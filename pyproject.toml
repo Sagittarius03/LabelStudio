@@ -11,6 +11,7 @@ dependencies = [
     "python-barcode[images]>=0.15,<1",
     "pystrich>=0.21,<0.22",
     "Pillow>=10,<13",
+    "zxing-cpp>=2.3,<3",
 ]
 
 [dependency-groups]

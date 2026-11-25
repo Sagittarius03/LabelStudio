@@ -7,21 +7,27 @@ import json
 import math
 import re
 import sys
+from io import BytesIO
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt, QSize, QSizeF, QRect, QRectF, QPointF, Signal, QMarginsF, QSettings, QByteArray, QBuffer, QIODevice, QTimer
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QPageSize, QPageLayout, QAction, QKeySequence, QShortcut, QIcon, QTextLayout, QTextOption
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPen, QPixmap, QPageSize, QPageLayout, QAction, QKeySequence, QShortcut, QIcon, QTextLayout, QTextOption
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewWidget, QPrinterInfo
 from PySide6.QtWidgets import (
     QApplication, QAbstractItemView, QCheckBox, QComboBox, QColorDialog, QDoubleSpinBox, QGridLayout, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QFontComboBox, QInputDialog,
-    QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton, QMenu,
+    QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QTabWidget, QToolButton, QMenu, QProgressDialog,
     QToolBar, QVBoxLayout, QWidget, QHeaderView, QListWidget, QListWidgetItem, QScrollArea, QDockWidget,
 )
+
+try:
+    import zxingcpp as _zxingcpp
+except ImportError:
+    _zxingcpp = None
 
 APP = "Label Studio"
 INK = "#20242b"
@@ -122,9 +128,7 @@ def element_bounds_in_label(element: Element, template: "LabelTemplate", toleran
 
 def extract_gs1_fields(raw: str) -> dict[str, str]:
     """Extract common GTIN (AI 01) and serial (AI 21) fields from GS1/ЧЗ text."""
-    value = str(raw or "").replace("\x1d", "<GS>").replace("\\x1d", "<GS>")
-    value = re.sub(r"^\]d2", "", value, flags=re.IGNORECASE).strip()
-    value = value.replace("(01)", "01").replace("(21)", "21").replace("(91)", "91").replace("(92)", "92")
+    value = normalize_gs1_payload(raw).strip()
     result = {"GTIN": "", "Серийный номер": ""}
     gtin_match = re.search(r"(?:^|[^0-9])01(\d{14})", value)
     if gtin_match:
@@ -159,6 +163,23 @@ def resolve_template_value(value: str, row: dict[str, Any]) -> str:
             return extract_gs1_fields(row.get(key[7:], ""))["Серийный номер"]
         return str(row.get(key, ""))
     return re.sub(r"\{([^{}]+)\}", replace, value)
+
+
+def normalize_gs1_payload(raw: str) -> str:
+    """Convert parenthesized GS1 AI notation to the encoded data stream."""
+    value=str(raw or "").replace("\\x1d","<GS>").replace("\x1d","<GS>")
+    value=re.sub(r"^\]d[12]","",value,flags=re.IGNORECASE)
+    matches=list(re.finditer(r"\((\d{2,4})\)",value))
+    if matches:
+        pieces=[]
+        variable_ais={"10","21","22","30","37",*(f"{number:02d}" for number in range(90,100))}
+        for index,match in enumerate(matches):
+            end=matches[index+1].start() if index+1<len(matches) else len(value)
+            ai=match.group(1);data=value[match.end():end]
+            pieces.append(ai+data)
+            if index+1<len(matches) and ai in variable_ais:pieces.append("<GS>")
+        value="".join(pieces)
+    return value
 
 
 @dataclass
@@ -561,6 +582,7 @@ class LabelCanvas(QWidget):
     selected = Signal(int)
     selectionChanged = Signal(object)
     elementDoubleClicked = Signal(int)
+    contextRequested = Signal(int, object)
     moved = Signal()
     zoomChanged = Signal(float)
 
@@ -669,6 +691,21 @@ class LabelCanvas(QWidget):
         p.drawText(QRectF(x0, y0 + h + 9, w, 20), Qt.AlignmentFlag.AlignLeft,
                    f"{self.template.width:.3f} × {self.template.height:.3f} мм")
         p.end()
+
+    def contextMenuEvent(self,event):
+        ox,oy=getattr(self,"origin",(0,0));point=QPointF(event.pos())
+        target=-1
+        for index in range(len(self.template.elements)-1,-1,-1):
+            element=self.template.elements[index]
+            rect=QRectF(ox+element.x*self.scale,oy+element.y*self.scale,element.width*self.scale,element.height*self.scale)
+            if rect.contains(self._unrotate(point,rect,element.rotation)):
+                target=index;break
+        if target>=0:
+            if target not in self.selected_indices:
+                self.selected_index=target;self.selected_indices={target}
+                self.selected.emit(target);self.selectionChanged.emit(set(self.selected_indices));self.update()
+            self.contextRequested.emit(target,event.globalPos());event.accept();return
+        super().contextMenuEvent(event)
 
     def _fit_scale(self):
         return max(2.5,min((self.width()-100)/max(self.template.width,1),(self.height()-90)/max(self.template.height,1),12))
@@ -800,10 +837,12 @@ class LabelCanvas(QWidget):
         position=el.hri_position
         if position == "hidden":
             painter.drawImage(rect,image); return
+        inside=position in ("inside_top","inside_bottom","inside_center")
         caption_mm=max(1.5,(el.hri_font_size * 25.4 / 72) * (1.45 if preview else 1.35))
         caption_height=min(rect.height()*.32,caption_mm*(scale if preview else 1))
         gap=min(.45*(scale if preview else 1),rect.height()*.035)
-        if position == "top": barcode_rect=QRectF(rect.left(),rect.top()+caption_height+gap,rect.width(),max(1,rect.height()-caption_height-gap))
+        if inside:barcode_rect=rect
+        elif position == "top": barcode_rect=QRectF(rect.left(),rect.top()+caption_height+gap,rect.width(),max(1,rect.height()-caption_height-gap))
         elif position == "bottom": barcode_rect=QRectF(rect.left(),rect.top(),rect.width(),max(1,rect.height()-caption_height-gap))
         elif position == "both": barcode_rect=QRectF(rect.left(),rect.top()+caption_height+gap,rect.width(),max(1,rect.height()-caption_height*2-gap*2))
         else: barcode_rect=rect
@@ -812,7 +851,19 @@ class LabelCanvas(QWidget):
         font=QFont("Arial")
         wanted=round(el.hri_font_size*96/72*scale/3.78) if preview else round(el.hri_font_size*25.4/72)
         available=caption_height
-        font.setPixelSize(max(1,min(wanted,round(available*.72)))); painter.setFont(font); painter.setPen(QColor(el.color))
+        font.setPixelSize(max(1,min(wanted,round(available*.72))))
+        if inside:
+            max_text_width=max(1,rect.width()-4);metrics=QFontMetricsF(font)
+            while metrics.horizontalAdvance(text)>max_text_width and font.pixelSize()>1:
+                font.setPixelSize(font.pixelSize()-1);metrics=QFontMetricsF(font)
+            text_width=min(max_text_width,metrics.horizontalAdvance(text)+4);text_height=min(caption_height,metrics.height()+2)
+            x={"left":rect.left()+2,"center":rect.center().x()-text_width/2,"right":rect.right()-text_width-2}.get(el.hri_alignment,rect.center().x()-text_width/2)
+            y={"inside_top":rect.top()+1,"inside_bottom":rect.bottom()-text_height-1,"inside_center":rect.center().y()-text_height/2}[position]
+            label_rect=QRectF(x,y,text_width,text_height)
+            painter.setPen(Qt.PenStyle.NoPen);painter.setBrush(QColor(255,255,255,235));painter.drawRoundedRect(label_rect,1.2,1.2)
+            painter.setFont(font);painter.setPen(QColor(el.color));painter.drawText(label_rect,Qt.AlignmentFlag.AlignCenter,text)
+            painter.restore();return
+        painter.setFont(font); painter.setPen(QColor(el.color))
         flags={"left":Qt.AlignmentFlag.AlignLeft,"center":Qt.AlignmentFlag.AlignHCenter,"right":Qt.AlignmentFlag.AlignRight}.get(el.hri_alignment,Qt.AlignmentFlag.AlignHCenter)|Qt.AlignmentFlag.AlignVCenter
         if position in ("top","both"):
             painter.drawText(QRectF(rect.left(),rect.top(),rect.width(),caption_height),flags,text)
@@ -831,6 +882,8 @@ class LabelCanvas(QWidget):
                 pil=qr.make_image(fill_color="black",back_color="white").convert("RGB")
             elif el.kind == "datamatrix":
                 from pystrich.datamatrix import DataMatrixData, DataMatrixEncoder, FNC1
+                text=normalize_gs1_payload(text) if el.gs1 else text
+                text=text.replace("<GS>","\x1d")
                 payload = DataMatrixData(FNC1, text, encoding="ascii") if el.gs1 else DataMatrixData(text, auto_encoding=True)
                 image = QImage.fromData(DataMatrixEncoder(payload,quiet_zone=0).get_imagedata(cellsize=5))
                 return image if not image.isNull() else None
@@ -1501,6 +1554,8 @@ class MainWindow(QMainWindow):
         self.object_list = QListWidget(); self.object_list.setObjectName("objectList")
         self.object_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.object_list.itemSelectionChanged.connect(self._list_selection_changed)
+        self.object_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.object_list.customContextMenuRequested.connect(self._object_list_context_menu)
         ll.addWidget(self.object_list, 1)
         layer_controls=QHBoxLayout()
         self.layer_up_btn=QPushButton("↑");self.layer_up_btn.setToolTip("Поднять слой выше");self.layer_up_btn.clicked.connect(lambda:self.move_layer(1))
@@ -1585,7 +1640,7 @@ class MainWindow(QMainWindow):
         self.fill_check=QCheckBox("Заливка фигуры")
         self.align_h_combo=QComboBox(); self.align_h_combo.addItem("Слева","left"); self.align_h_combo.addItem("По центру","center"); self.align_h_combo.addItem("Справа","right")
         self.align_v_combo=QComboBox(); self.align_v_combo.addItem("Сверху","top"); self.align_v_combo.addItem("По центру","center"); self.align_v_combo.addItem("Снизу","bottom")
-        self.hri_position_combo=QComboBox(); self.hri_position_combo.addItem("Скрыть","hidden"); self.hri_position_combo.addItem("Сверху","top"); self.hri_position_combo.addItem("Снизу","bottom"); self.hri_position_combo.addItem("Сверху и снизу","both")
+        self.hri_position_combo=QComboBox(); self.hri_position_combo.addItem("Скрыть","hidden"); self.hri_position_combo.addItem("Сверху","top"); self.hri_position_combo.addItem("Снизу","bottom"); self.hri_position_combo.addItem("Сверху и снизу","both"); self.hri_position_combo.addItem("Внутри сверху","inside_top"); self.hri_position_combo.addItem("Внутри снизу","inside_bottom"); self.hri_position_combo.addItem("Внутри по центру","inside_center")
         self.hri_align_combo=QComboBox(); self.hri_align_combo.addItem("Слева","left"); self.hri_align_combo.addItem("По центру","center"); self.hri_align_combo.addItem("Справа","right")
         self.hri_font_spin=self.num(8,4,36)
         self.dm_summary=QLabel("GTIN: —\nСерийный номер: —"); self.dm_summary.setWordWrap(True)
@@ -1729,6 +1784,7 @@ class MainWindow(QMainWindow):
 
     def _connect_canvas(self,canvas):
         canvas.selectionChanged.connect(self.select_elements)
+        canvas.contextRequested.connect(self._show_element_context_menu)
         canvas.moved.connect(self.refresh_properties)
         canvas.moved.connect(self.refresh_print_preview)
         canvas.elementDoubleClicked.connect(self.edit_element_value)
@@ -1983,9 +2039,43 @@ class MainWindow(QMainWindow):
         if not 0<=index<len(self.template.elements):return
         element=self.template.elements[index]
         if element.kind not in ("text","symbol","qr","barcode","datamatrix"):return
-        value,accepted=QInputDialog.getText(self,"Изменить значение объекта","Текст, код или переменная:",QLineEdit.EchoMode.Normal,element.value)
+        value,accepted=QInputDialog.getMultiLineText(self,"Изменить значение объекта","Текст, код или переменная:",element.value)
         if accepted:
             element.value=value;self.canvas.selected_index=index;self.select_element(index);self.canvas.update();self.refresh_print_preview()
+
+    def _object_list_context_menu(self,position):
+        item=self.object_list.itemAt(position)
+        if item is None:return
+        index=int(item.data(Qt.ItemDataRole.UserRole))
+        if index not in self.canvas.selected_indices:self.select_elements({index})
+        self._show_element_context_menu(index,self.object_list.viewport().mapToGlobal(position))
+
+    def _show_element_context_menu(self,index,global_position):
+        if not 0<=index<len(self.template.elements):return
+        if index not in self.canvas.selected_indices:self.select_elements({index})
+        selected=self.selected_elements();editable=[element for element in selected if element.kind in ("text","symbol","qr","barcode","datamatrix")]
+        menu=QMenu(self)
+        if editable:
+            edit=menu.addAction("Изменить данные…")
+            edit.triggered.connect(lambda:self._edit_selected_element_values(editable))
+            properties=menu.addAction("Открыть свойства")
+            properties.triggered.connect(lambda:self.property_tabs.setCurrentIndex(0))
+            menu.addSeparator()
+        menu.addAction("Копировать",self.copy_selected_object)
+        menu.addAction("Дублировать",self.duplicate_selected_object)
+        menu.addAction("Вставить скопированный объект",self.paste_copied_object)
+        menu.addSeparator()
+        menu.addAction("Заблокировать / разблокировать",self.toggle_layer_lock)
+        menu.addAction("Удалить",self.delete_element)
+        menu.exec(global_position)
+
+    def _edit_selected_element_values(self,elements):
+        editable=[element for element in elements if element in self.template.elements and element.kind in ("text","symbol","qr","barcode","datamatrix")]
+        if not editable:return
+        value,accepted=QInputDialog.getMultiLineText(self,"Изменить данные объекта","Текст, код или переменная:",editable[0].value)
+        if not accepted:return
+        for element in editable:element.value=value
+        self.value_edit.setText(value);self.canvas.update();self.refresh_dm_summary();self.refresh_print_preview()
 
     def section(self, text):
         label = QLabel(text); label.setStyleSheet(f"font-size:10px; font-weight:700; letter-spacing:1px; color:{MUTED}; padding:7px 0")
@@ -2041,59 +2131,184 @@ class MainWindow(QMainWindow):
     def insert_pdf_element(self):
         path,_=QFileDialog.getOpenFileName(self,"Выбрать PDF","","PDF-файлы (*.pdf)")
         if not path:return
+        progress=None
         try:
             dialog=PdfRegionDialog(path,self)
             if dialog.exec()!=QDialog.DialogCode.Accepted:return
             document=dialog.document;page=dialog.canvas.page;selection=dialog.canvas.crop_points()
+            progress=QProgressDialog("Распознавание выделенной области PDF…","",0,0,self);progress.setCancelButton(None);progress.setWindowModality(Qt.WindowModality.ApplicationModal);progress.setMinimumDuration(0);progress.setAutoClose(False);progress.show();QApplication.processEvents()
             lines=self._pdf_region_text_lines(document,page,selection)
-            if not lines:
-                QMessageBox.information(self,"Редактируемые объекты не найдены","В выделенной области нет доступного текстового слоя PDF. Для редактирования PDF должен содержать текстовые объекты или распознаваемую GS1-строку.");return
-            code_line=next((line for line in lines if re.search(r"01\d{14}21",line["text"])),None)
-            code_rect=None;code_value=""
-            if code_line:
-                following=next((line for line in lines if code_line["y"]<line["y"]<=code_line["y"]+14 and line["x"]>=code_line["x"]-3),None)
-                code_value=re.sub(r"\s+","",code_line["text"]+(following["text"] if following else ""))
-                size=min(selection.width()*.42,selection.height()*.7)
-                code_rect=QRectF(code_line["x"],code_line["y"]-size-8,size,size)
+            codes=self._pdf_decode_codes(document,page,selection,progress_callback=lambda message:(progress.setLabelText(message),QApplication.processEvents()))
+            fallback_code=self._pdf_join_code_lines(lines)
+            decoded_matrix=next((code for code in codes if code["kind"]=="datamatrix"),None)
+            if fallback_code and decoded_matrix and len(fallback_code.replace("<GS>",""))>len(decoded_matrix["text"].replace("<GS>","")):
+                decoded_matrix["text"]=fallback_code
+            elif fallback_code and not decoded_matrix:
+                source=next(line for line in lines if re.search(r"01\d{14}21",re.sub(r"\s+","",normalize_gs1_payload(line["text"]))))
+                size=min(selection.width()*.42,selection.height()*.6)
+                codes.append({"kind":"datamatrix","text":fallback_code,"rect":QRectF(source["x"],max(selection.top(),source["y"]-size-3),size,size)})
+            code_text_rects=[code["rect"] for code in codes]
+            code_text_lines=self._pdf_gs1_line_indexes(lines)
             bounds=QRectF()
             for line in lines:
                 rect=QRectF(line["x"],line["y"],line["width"],line["height"])
                 bounds=rect if bounds.isNull() else bounds.united(rect)
-            if code_rect:bounds=bounds.united(code_rect)
+            for rect in code_text_rects:bounds=rect if bounds.isNull() else bounds.united(rect)
+            if bounds.isNull():bounds=QRectF(selection)
             bounds=bounds.adjusted(-1.5,-1.5,1.5,1.5).intersected(selection)
             if bounds.width()<2 or bounds.height()<2:raise ValueError("Не удалось автоматически определить границы содержимого.")
             mm_per_point=25.4/72;region_w=bounds.width()*mm_per_point;region_h=bounds.height()*mm_per_point
             base_x,base_y=self._view_center_position(region_w,region_h)
-            additions=[]
+            raster=self._pdf_region_raster(document,page,bounds,lines,[code["rect"] for code in codes])
+            additions=[Element(kind="image",x=base_x,y=base_y,width=round(region_w,3),height=round(region_h,3),value="Фрагмент PDF — графика",asset_data=image_to_base64(raster))]
             for index,line in enumerate(lines):
+                if index in code_text_lines:continue
                 x=base_x+(line["x"]-bounds.left())*mm_per_point;y=base_y+(line["y"]-bounds.top())*mm_per_point
                 width=max(2,line["width"]*mm_per_point+1);height=max(2,line["height"]*mm_per_point+1)
                 font_size=max(3,round(line["height"]*.9))
                 height=max(height,font_size*25.4/72*1.4)
                 additions.append(Element(kind="text",x=round(x,3),y=round(y,3),width=round(width,3),height=round(height,3),value=line["text"],font_size=font_size,bold=index==0))
-            if code_rect and code_value:
-                size=code_rect.width()*mm_per_point
-                additions.append(Element(kind="datamatrix",x=round(base_x+(code_rect.x()-bounds.left())*mm_per_point,3),y=round(base_y+(code_rect.y()-bounds.top())*mm_per_point,3),width=round(size,3),height=round(size,3),value=code_value,gs1=True))
+            for code in codes:
+                rect=code["rect"]
+                x=round(base_x+(rect.x()-bounds.left())*mm_per_point,3);y=round(base_y+(rect.y()-bounds.top())*mm_per_point,3)
+                w=round(rect.width()*mm_per_point,3);h=round(rect.height()*mm_per_point,3)
+                additions.append(Element(kind=code["kind"],x=x,y=y,width=w,height=h,value=code["text"],gs1=code["kind"]=="datamatrix",barcode_type=code.get("barcode_type","Code 128")))
             self.template.elements.extend(additions);self.canvas.selected_index=len(self.template.elements)-1
             self.canvas.selected_indices={self.canvas.selected_index};self.refresh_object_list();self.select_element(self.canvas.selected_index);self.canvas.update();self.refresh_print_preview()
-            self.status.setText(f"Из PDF добавлено редактируемых объектов: {len(additions)}")
-        except Exception as exc:QMessageBox.critical(self,"Не удалось вставить область PDF",str(exc))
+            self.status.setText(f"Из PDF добавлено объектов: {len(additions)}; графика сохранена изображением")
+        except Exception as exc:
+            if progress:progress.close()
+            QMessageBox.critical(self,"Не удалось вставить область PDF",str(exc))
+        finally:
+            if progress:progress.close()
 
     @staticmethod
     def _pdf_region_text_lines(document,page,area):
         text=document.getAllText(page).text();words=[]
         for match in re.finditer(r"\S+",text):
             token=match.group()
-            if re.fullmatch(r"\d",token):continue
             rect=document.getSelectionAtIndex(page,match.start(),len(token)).boundingRectangle()
             if rect.width()>0 and rect.height()>0 and area.contains(rect.center()):
                 words.append((rect.y(),rect.x(),rect.width(),rect.height(),token))
         groups=[]
         for y,x,w,h,token in sorted(words):
-            line=next((entry for entry in groups if abs(entry["y"]-y)<=2),None)
+            line=next((entry for entry in groups if abs(entry["y"]-y)<=1.0),None)
             if line is None:line={"y":y,"x":x,"right":x+w,"height":h,"parts":[]};groups.append(line)
             line["parts"].append((x,token));line["x"]=min(line["x"],x);line["right"]=max(line["right"],x+w);line["height"]=max(line["height"],h)
         return [{"x":line["x"],"y":line["y"],"width":line["right"]-line["x"],"height":line["height"],"text":" ".join(word for _x,word in sorted(line["parts"]))} for line in sorted(groups,key=lambda line:line["y"])]
+
+    @staticmethod
+    def _pdf_render_region(document,page,area,scale=4.0,page_image=None):
+        page_size=document.pagePointSize(page)
+        full=QRectF(0,0,page_size.width(),page_size.height())
+        area=QRectF(area).intersected(full)
+        if area.isEmpty():return QImage()
+        rendered=page_image
+        if rendered is None:
+            width=max(1,min(6000,round(page_size.width()*scale)));height=max(1,min(6000,round(page_size.height()*scale)))
+            rendered=document.render(page,QSize(width,height))
+        if rendered.isNull():return QImage()
+        x=round(area.x()*rendered.width()/page_size.width());y=round(area.y()*rendered.height()/page_size.height())
+        w=max(1,round(area.width()*rendered.width()/page_size.width()));h=max(1,round(area.height()*rendered.height()/page_size.height()))
+        return rendered.copy(x,y,w,h)
+
+    @classmethod
+    def _pdf_decode_codes(cls,document,page,area,page_cache=None,progress_callback=None):
+        zxingcpp=_zxingcpp
+        if zxingcpp is None:
+            hint="В каталоге проекта выполните `uv sync`, затем запустите приложение командой `uv run main.py`." if sys.platform.startswith("linux") else "Переустановите приложение из актуальной сборки."
+            raise RuntimeError(f"Не найден модуль распознавания zxing-cpp. {hint}")
+        try:
+            if page_cache is not None and page in page_cache:
+                all_codes=page_cache[page]
+            else:
+                page_size=document.pagePointSize(page);page_area=QRectF(0,0,page_size.width(),page_size.height());found=[]
+                scan_errors=[]
+                for scale in (4.0,6.0,8.0):
+                    image=cls._pdf_render_region(document,page,page_area,scale)
+                    if image.isNull():continue
+                    from PIL import Image
+                    png=QByteArray();buffer=QBuffer(png);buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+                    if not image.save(buffer,"PNG"):
+                        buffer.close();continue
+                    decoder_image=Image.open(BytesIO(bytes(png))).convert("RGB");buffer.close()
+                    for mode in (zxingcpp.TextMode.Escaped,zxingcpp.TextMode.HRI):
+                        if progress_callback:progress_callback(f"Распознавание кодов: страница {page+1}, масштаб {scale:.0f}×")
+                        try:decoded=zxingcpp.read_barcodes(decoder_image,text_mode=mode)
+                        except Exception as exc:scan_errors.append(str(exc));continue
+                        for item in decoded:
+                            value=str(item.text or "").strip()
+                            if not value:continue
+                            corners=item.position
+                            xs=[float(p.x) for p in (corners.top_left,corners.top_right,corners.bottom_right,corners.bottom_left)]
+                            ys=[float(p.y) for p in (corners.top_left,corners.top_right,corners.bottom_right,corners.bottom_left)]
+                            rect=QRectF(min(xs)*page_size.width()/image.width(),min(ys)*page_size.height()/image.height(),(max(xs)-min(xs))*page_size.width()/image.width(),(max(ys)-min(ys))*page_size.height()/image.height()).adjusted(-1,-1,1,1)
+                            fmt=str(item.format).lower()
+                            kind="qr" if "qr" in fmt else "datamatrix" if "data" in fmt and "matrix" in fmt else "barcode"
+                            if kind=="datamatrix":value=normalize_gs1_payload(value)
+                            if kind=="barcode" and not any(name in fmt for name in ("code128","code39","ean13","upca","itf")):continue
+                            if kind=="barcode" and "ean13" in fmt:barcode_type="EAN-13"
+                            elif kind=="barcode" and "upca" in fmt:barcode_type="UPC-A"
+                            elif kind=="barcode" and "itf" in fmt:barcode_type="ITF"
+                            elif kind=="barcode" and "code39" in fmt:barcode_type="Code 39"
+                            else:barcode_type="Code 128"
+                            duplicate=next((entry for entry in found if entry["kind"]==kind and (entry["rect"].center()-rect.center()).manhattanLength()<max(4,min(rect.width(),rect.height())*.35)),None)
+                            if duplicate is None:found.append({"kind":kind,"text":value,"rect":rect,"barcode_type":barcode_type})
+                            elif len(value.replace("<GS>",""))>len(duplicate["text"].replace("<GS>","")):
+                                duplicate.update(text=value,rect=rect,barcode_type=barcode_type)
+                if scan_errors and not found:
+                    raise RuntimeError(f"Не удалось запустить распознавание DataMatrix в PDF: {scan_errors[-1]}")
+                all_codes=sorted(found,key=lambda code:(code["rect"].top(),code["rect"].left()))
+                if page_cache is not None:page_cache[page]=all_codes
+            return [code for code in all_codes if area.contains(code["rect"].center())]
+        except RuntimeError:raise
+        except Exception as exc:
+            raise RuntimeError(f"Ошибка анализа кодов PDF: {exc}") from exc
+
+    @classmethod
+    def _pdf_region_raster(cls,document,page,area,lines,codes,page_image=None):
+        image=cls._pdf_render_region(document,page,area,4.0,page_image)
+        if image.isNull():return image
+        page_size=document.pagePointSize(page);sx=image.width()/max(area.width(),1);sy=image.height()/max(area.height(),1)
+        painter=QPainter(image);painter.setPen(Qt.PenStyle.NoPen);painter.setBrush(QColor("white"))
+        for line in lines:
+            rect=QRectF((line["x"]-area.x())*sx,(line["y"]-area.y())*sy,line["width"]*sx,line["height"]*sy).adjusted(-2,-2,2,2)
+            painter.drawRect(rect)
+        for code in codes:
+            rect=QRectF((code.x()-area.x())*sx,(code.y()-area.y())*sy,code.width()*sx,code.height()*sy).adjusted(-3,-3,3,3)
+            painter.drawRect(rect)
+        painter.end();return image
+
+    @staticmethod
+    def _pdf_gs1_line_indexes(lines):
+        ordered=sorted(enumerate(lines),key=lambda pair:(pair[1]["y"],pair[1]["x"]))
+        start=next((index for index,(_original_index,line) in enumerate(ordered) if re.search(r"01\d{14}21",re.sub(r"\s+","",normalize_gs1_payload(line["text"])))),None)
+        if start is None:return set()
+        original_index,base=ordered[start];selected={original_index}
+        for original_index,line in ordered[start+1:]:
+            if line["y"]-base["y"]>max(18,base["height"]*3.5):break
+            text=line["text"].strip()
+            if not text or re.search(r"[А-Яа-яЁё:]",text):break
+            if line["x"]>base["x"]+max(24,base["width"]*.6):break
+            selected.add(original_index);base=line
+            if len(selected)>=5:break
+        return selected
+
+    @classmethod
+    def _pdf_join_code_lines(cls,lines):
+        """Reassemble a GS1 payload split by PDF text extraction into several lines."""
+        selected_indexes=cls._pdf_gs1_line_indexes(lines)
+        if not selected_indexes:return ""
+        selected=sorted((lines[index] for index in selected_indexes),key=lambda line:(line["y"],line["x"]))
+        tokens=[]
+        for line in selected:
+            for token in re.findall(r"\S+",line["text"]):
+                token=re.sub(r"^\((91|92)\)",r"\1",token)
+                if tokens and re.fullmatch(r"(?:91|92)\S*",token) and re.search(r"01\d{14}21", "".join(tokens).replace("<GS>","")):
+                    tokens.append("<GS>")
+                tokens.append(token)
+        value="".join(tokens)
+        return normalize_gs1_payload(value)
 
     @staticmethod
     def _cluster_pdf_coordinates(values,tolerance=3.0):
@@ -2103,14 +2318,19 @@ class MainWindow(QMainWindow):
             else:groups[-1].append(value)
         return [sum(group)/len(group) for group in groups]
 
-    def _pdf_text_anchors(self,document):
+    def _pdf_text_anchors(self,document,progress=None):
         pattern=re.compile(r"\b[A-Z0-9]{2,}_[A-Z0-9_-]{2,}\b");pages=[]
         for page in range(document.pageCount()):
+            if progress:
+                progress.setLabelText(f"Поиск этикеток в PDF · страница {page+1} из {document.pageCount()}")
+                progress.setValue(page);QApplication.processEvents()
             text=document.getAllText(page).text();anchors=[]
             for match in pattern.finditer(text):
                 rect=document.getSelectionAtIndex(page,match.start(),len(match.group())).boundingRectangle()
                 if rect.width()>0 and rect.height()>0:anchors.append({"name":match.group(),"x":rect.x(),"y":rect.y(),"rect":rect})
             pages.append(anchors)
+        if progress:
+            progress.setValue(document.pageCount());QApplication.processEvents()
         first=next((page for page in pages if len(page)>=2),[])
         if len(first)<2:return pages,[],[]
         xs=self._cluster_pdf_coordinates([item["x"] for item in first]);ys=self._cluster_pdf_coordinates([item["y"] for item in first])
@@ -2568,10 +2788,13 @@ class MainWindow(QMainWindow):
         path,_=QFileDialog.getOpenFileName(self,"Импортировать этикетки из PDF","","PDF-файлы (*.pdf)")
         if not path:return
         document=QPdfDocument(self)
+        progress=None
         try:
             error=document.load(path)
             if error!=QPdfDocument.Error.None_:raise ValueError(f"Не удалось открыть PDF: {error}")
-            pages,xs,ys=self._pdf_text_anchors(document)
+            page_count=max(1,document.pageCount())
+            progress=QProgressDialog("Подготовка PDF…","",0,page_count,self);progress.setCancelButton(None);progress.setWindowModality(Qt.WindowModality.ApplicationModal);progress.setMinimumDuration(0);progress.setAutoClose(False);progress.setAutoReset(False);progress.show();QApplication.processEvents()
+            pages,xs,ys=self._pdf_text_anchors(document,progress)
             if not xs or not ys:
                 QMessageBox.warning(self,"Не найдена сетка этикеток","Не удалось найти повторяющиеся заголовки этикеток в текстовом слое PDF. Отдельную область можно добавить через инструмент «Элемент PDF».");return
             first_page=next(i for i,page in enumerate(pages) if page);page_size=document.pagePointSize(first_page)
@@ -2582,13 +2805,17 @@ class MainWindow(QMainWindow):
             if size_match:guessed_w=float(size_match.group(1));guessed_h=float(size_match.group(2))
             detected=sum(len(page) for page in pages)
             options=PdfImportOptionsDialog(Path(path).name,document.pageCount(),f"{len(xs)} × {len(ys)}; всего меток текста: {detected}",guessed_w,guessed_h,self)
+            progress.hide()
             if options.exec()!=QDialog.DialogCode.Accepted:return
             width_mm=options.width_spin.value();height_mm=options.height_spin.value()
             crop_w=width_mm*72/25.4;crop_h=height_mm*72/25.4
             offset_x=options.left_offset.value()*72/25.4;offset_y=options.top_offset.value()*72/25.4
+            progress.setLabelText("Извлечение текста и графики из PDF…");progress.setRange(0,page_count);progress.setValue(0);progress.show();QApplication.processEvents()
             labels=[]
             for page_index,anchors in enumerate(pages):
-                if not anchors:continue
+                progress.setLabelText(f"Извлечение текста · страница {page_index+1} из {page_count}");progress.setValue(page_index);QApplication.processEvents()
+                if not anchors:
+                    progress.setValue(page_index+1);QApplication.processEvents();continue
                 page_wh=document.pagePointSize(page_index);cells=[]
                 for anchor in anchors:
                     crop=QRectF(anchor["x"]-offset_x,anchor["y"]-offset_y,crop_w,crop_h).intersected(QRectF(0,0,page_wh.width(),page_wh.height()))
@@ -2597,7 +2824,6 @@ class MainWindow(QMainWindow):
                 text=document.getAllText(page_index).text()
                 for match in re.finditer(r"\S+",text):
                     token=match.group()
-                    if re.fullmatch(r"\d",token):continue
                     rect=document.getSelectionAtIndex(page_index,match.start(),len(token)).boundingRectangle()
                     if rect.width()<=0 or rect.height()<=0:continue
                     center=rect.center();candidates=[cell for cell in cells if cell["crop"].contains(center)]
@@ -2607,67 +2833,119 @@ class MainWindow(QMainWindow):
                 for cell in cells:
                     groups=[]
                     for y,x,w,h,token in sorted(cell["lines"]):
-                        line=next((item for item in groups if abs(item["y"]-y)<=2),None)
+                        line=next((item for item in groups if abs(item["y"]-y)<=1.0),None)
                         if line is None:line={"y":y,"x":x,"right":x+w,"height":h,"parts":[]};groups.append(line)
                         line["parts"].append((x,token));line["x"]=min(line["x"],x);line["right"]=max(line["right"],x+w);line["height"]=max(line["height"],h)
                     cell["lines"]=[{"x":line["x"],"y":line["y"],"width":line["right"]-line["x"],"height":line["height"],"text":" ".join(word for _x,word in sorted(line["parts"])),"parts":line["parts"]} for line in sorted(groups,key=lambda item:item["y"])]
                     if cell["lines"]:labels.append(cell)
+                progress.setValue(page_index+1);QApplication.processEvents()
             if not labels:raise ValueError("На страницах не удалось выделить текстовые строки этикеток.")
+            progress.setRange(0,page_count+len(labels));progress.setValue(page_count);QApplication.processEvents()
+            barcode_page_cache={}
+            raster_page_cache={}
+            for label_index,label in enumerate(labels):
+                page_index=label["page"]
+                progress.setLabelText(f"Распознавание объектов и изображений · этикетка {label_index+1} из {len(labels)} (страница {page_index+1})")
+                progress.setValue(page_count+label_index);QApplication.processEvents()
+                def update_code_progress(message):
+                    progress.setLabelText(message);QApplication.processEvents()
+                label["codes"]=self._pdf_decode_codes(document,page_index,label["crop"],barcode_page_cache,update_code_progress)
+                label["code_values"]={kind:[code["text"] for code in label["codes"] if code["kind"]==kind] for kind in ("qr","datamatrix","barcode")}
+                fallback=self._pdf_join_code_lines(label["lines"])
+                current=label["code_values"]["datamatrix"]
+                if fallback and (not current or len(fallback.replace("<GS>",""))>len(current[0].replace("<GS>",""))):
+                    if current:
+                        matrix=next((code for code in label["codes"] if code["kind"]=="datamatrix"),None)
+                        if matrix:matrix["text"]=fallback
+                        label["code_values"]["datamatrix"][0]=fallback
+                    else:label["code_values"]["datamatrix"].append(fallback)
+                code_text_lines=self._pdf_gs1_line_indexes(label["lines"])
+                if page_index not in raster_page_cache:
+                    raster_page_cache.clear()
+                    progress.setLabelText(f"Сохранение графики · страница {page_index+1}");QApplication.processEvents()
+                    page_size=document.pagePointSize(page_index)
+                    raster_page_cache[page_index]=self._pdf_render_region(document,page_index,QRectF(0,0,page_size.width(),page_size.height()),4.0)
+                raster_image=self._pdf_region_raster(document,page_index,label["crop"],label["lines"],[code["rect"] for code in label["codes"]],raster_page_cache[page_index])
+                label["raster_data"]=image_to_base64(raster_image);del raster_image
+                label["lines"]=[line for index,line in enumerate(label["lines"]) if index not in code_text_lines]
+                progress.setValue(page_count+label_index+1);QApplication.processEvents()
             first=labels[0];reference=first["lines"];descriptors=[]
             for index,line in enumerate(reference,1):descriptors.append({"key":f"PDF_TEXT_{index:02d}","x":line["x"]-first["crop"].left(),"y":line["y"]-first["crop"].top(),"height":line["height"],"width":line["width"],"text":line["text"]})
-            has_code=any(re.search(r"01\d{14}21",line["text"]) for label in labels for line in label["lines"])
+            code_kinds=[kind for kind in ("qr","datamatrix","barcode") if any(label["code_values"].get(kind) for label in labels)]
+            code_slots=[]
+            for kind in code_kinds:
+                count=max(len(label["code_values"].get(kind,[])) for label in labels)
+                for slot in range(count):
+                    key={"qr":"QR_CODE","datamatrix":"DATA_MATRIX","barcode":"BARCODE"}[kind]
+                    if slot:key+=f"_{slot+1:02d}"
+                    code_slots.append({"kind":kind,"slot":slot,"key":key})
             template=LabelTemplate(name=f"{Path(path).stem} · PDF",width=width_mm,height=height_mm,elements=[])
             sx=width_mm/max(crop_w,1);sy=height_mm/max(crop_h,1)
+            template.elements.append(Element(kind="image",x=0,y=0,width=width_mm,height=height_mm,value="{PDF_RASTER}") )
             for index,line in enumerate(descriptors):
                 x=max(0,line["x"]*sx);y=max(0,line["y"]*sy)
                 element_width=max(4,width_mm-x-.7);element_height=max(2,line["height"]*sy+1.1)
                 font_size=max(3,round(line["height"]*.92))
                 element_height=max(element_height,font_size*25.4/72*1.4)
                 template.elements.append(Element(kind="text",x=round(x,3),y=round(y,3),width=round(element_width,3),height=round(element_height,3),value="{"+line["key"]+"}",font_size=font_size,bold=index==0))
-            if has_code:
-                code_line=next((line for line in reference if re.search(r"01\d{14}21",line["text"])),None)
-                if code_line:
-                    code_size=round(min(width_mm*.41,height_mm*.62),3)
-                    code_x=max(0,round((code_line["x"]-first["crop"].left())*sx,3))
-                    code_y=max(0,round((first["anchor"]["y"]-first["crop"].top())*sy,3))
-                    template.elements.append(Element(kind="datamatrix",x=code_x,y=code_y,width=code_size,height=code_size,value="{DATA_MATRIX}",gs1=True))
+            for code_slot in code_slots:
+                kind=code_slot["kind"];slot=code_slot["slot"]
+                example=next((code for label in labels for code in [c for c in label["codes"] if c["kind"]==kind][slot:slot+1]),None)
+                if example:
+                    rect=example["rect"];code_x=max(0,round((rect.x()-first["crop"].left())*sx,3));code_y=max(0,round((rect.y()-first["crop"].top())*sy,3))
+                    code_w=max(3,round(rect.width()*sx,3));code_h=max(3,round(rect.height()*sy,3))
+                else:
+                    code_w=code_h=round(min(width_mm*.41,height_mm*.62),3);code_x=code_y=0
+                    if kind=="datamatrix":
+                        line=next((line for line in reference if re.search(r"01\d{14}21",line["text"].replace(" ",""))),None)
+                        if line:
+                            code_x=max(0,round((line["x"]-first["crop"].left())*sx,3))
+                            code_y=max(0,round((line["y"]-first["crop"].top())*sy-code_h-2,3))
+                template.elements.append(Element(kind=kind,x=code_x,y=code_y,width=code_w,height=code_h,value="{"+code_slot["key"]+"}",gs1=kind=="datamatrix",barcode_type=(example or {}).get("barcode_type","Code 128")))
             rows=[]
             for label in labels:
                 row={};available=list(label["lines"])
                 for descriptor in descriptors:
-                    best=min(available,key=lambda line:abs((line["x"]-label["crop"].left())-descriptor["x"])+2*abs((line["y"]-label["crop"].top())-descriptor["y"])) if available else None
-                    if best and abs((best["y"]-label["crop"].top())-descriptor["y"])<6:row[descriptor["key"]]=best["text"];available.remove(best)
+                    best=min(available,key=lambda line:abs((line["x"]-label["crop"].left())-descriptor["x"])+2*abs((line["y"]+line["height"]-label["crop"].top())-(descriptor["y"]+descriptor["height"]))) if available else None
+                    if best and abs((best["y"]+best["height"]-label["crop"].top())-(descriptor["y"]+descriptor["height"]))<max(3,descriptor["height"]*.35):row[descriptor["key"]]=best["text"];available.remove(best)
                     else:row[descriptor["key"]]=""
-                code_lines=[line for line in label["lines"] if re.search(r"01\d{14}21",line["text"])]
-                value=""
-                if code_lines:
-                    source=code_lines[0];value=source["text"]
-                    following=next((line for line in label["lines"] if source["y"]<line["y"]<=source["y"]+14 and line["x"]>=source["x"]-3),None)
-                    if following:value+=following["text"]
-                    value=re.sub(r"\s+","",value)
-                row["DATA_MATRIX"]=value;rows.append(row)
+                for code_slot in code_slots:
+                    values=label["code_values"].get(code_slot["kind"],[])
+                    value=values[code_slot["slot"]] if len(values)>code_slot["slot"] else ""
+                    row[code_slot["key"]]=normalize_gs1_payload(value) if code_slot["kind"]=="datamatrix" else value
+                row["PDF_RASTER"]=label["raster_data"]
+                rows.append(row)
             if not rows:raise ValueError("Не удалось подготовить строки тиража из PDF.")
-            self.add_document_tab(template);self.headers=[f"Текст {i+1}" for i in range(len(descriptors))]+(["DataMatrix"] if has_code else [])
-            keys=[line["key"] for line in descriptors]+(["DATA_MATRIX"] if has_code else [])
+            code_headers={"qr":"QR","datamatrix":"DataMatrix","barcode":"Штрихкод"}
+            self.add_document_tab(template);self.headers=[f"Текст {i+1}" for i in range(len(descriptors))]+[code_headers[slot["kind"]]+(f" {slot['slot']+1}" if sum(item["kind"]==slot["kind"] for item in code_slots)>1 else "") for slot in code_slots]+["Растровая графика"]
+            keys=[line["key"] for line in descriptors]+[slot["key"] for slot in code_slots]+["PDF_RASTER"]
             self.table_keys=keys;self.rows=rows;self.selected_file=path
             self.file_label.setText(Path(path).name);self.detach_btn.setEnabled(True);self.from_spin.setEnabled(True)
             self.field_combo.blockSignals(True);self.field_combo.clear();self.field_combo.addItem("Вручную","");self.field_combo.addItem("Нумерация тиража","SEQ")
-            for header,key in zip(self.headers,keys):self.field_combo.addItem(header,key)
+            for header,key in zip(self.headers,keys):
+                if key!="PDF_RASTER":self.field_combo.addItem(header,key)
             self.field_combo.blockSignals(False);self.table.blockSignals(True);self.table.setAlternatingRowColors(True);self.table.setColumnCount(len(self.headers));self.table.setHorizontalHeaderLabels(self.headers);self.table.setRowCount(len(rows))
             for row_index,row in enumerate(rows):
                 for column,key in enumerate(keys):
-                    self.table.setItem(row_index,column,QTableWidgetItem(row.get(key,"")))
+                    item=QTableWidgetItem("[растровое изображение]" if key=="PDF_RASTER" and row.get(key) else row.get(key,""))
+                    if key=="PDF_RASTER":item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    self.table.setItem(row_index,column,item)
             self.table.blockSignals(False)
             self.from_spin.setMaximum(len(rows));self.count_spin.setMaximum(len(rows));self.count_spin.setValue(len(rows));self.from_spin.setValue(1);self.preview_variant_spin.setValue(1)
             self.select_element(0);self.update_preview();self.refresh_print_preview();self.status.setText(f"Из PDF извлечено этикеток: {len(rows)}")
-        except Exception as exc:QMessageBox.critical(self,"Не удалось импортировать PDF",str(exc))
-        finally:document.close()
+        except Exception as exc:
+            if progress:progress.close()
+            QMessageBox.critical(self,"Не удалось импортировать PDF",str(exc))
+        finally:
+            if progress:progress.close()
+            document.close()
 
     def _table_cell_changed(self,row_index,column):
         if not (0<=row_index<len(self.rows) and 0<=column<len(self.table_keys)):return
         item=self.table.item(row_index,column)
         if item is None:return
         key=self.table_keys[column]
+        if key=="PDF_RASTER":return
         self.rows[row_index][key]=item.text()
         self.update_preview();self.refresh_print_preview()
 
