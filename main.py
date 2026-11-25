@@ -327,9 +327,15 @@ class PrintPreviewDialog(QDialog):
         label_h=self.owner.template.width if self.rotation in (90,270) else self.owner.template.height
         self.page_width=label_w*self.columns+self.gap*(self.columns-1)
         page_size=QPageSize(QSizeF(self.page_width,label_h),QPageSize.Unit.Millimeter,"Label layout",QPageSize.SizeMatchPolicy.ExactMatch)
-        self.printer.setPageSize(page_size)
-        self.printer.setPageOrientation(QPageLayout.Orientation.Portrait)
-        self.printer.setPageMargins(QMarginsF(0,0,0,0),QPageLayout.Unit.Millimeter);self.printer.setFullPage(True)
+        page_orientation=QPageLayout.Orientation.Landscape if self.page_width>label_h else QPageLayout.Orientation.Portrait
+        layout=QPageLayout(page_size,page_orientation,QMarginsF(0,0,0,0),QPageLayout.Unit.Millimeter)
+        self.printer.setPageLayout(layout)
+        self.printer.setFullPage(True)
+        # Compare the media dimensions (paperRect), not the printable rectangle:
+        # non-printable margins must not shrink the label artwork.
+        paper=self.printer.paperRect(QPrinter.Unit.Millimeter)
+        self.paper_size_mismatch=(abs(paper.width()-self.page_width)>0.15 or abs(paper.height()-label_h)>0.15)
+        self.actual_paper_size=(paper.width(),paper.height())
         self.printer.setCopyCount(1)  # Copies are expanded into the page sequence by the app.
         self.columns_label.setText(f"Текущая раскладка: {self.columns} колонок · зазор {self.gap:.2f} мм")
 
@@ -412,6 +418,14 @@ class PrintPreviewDialog(QDialog):
                 message+="\n\nПродолжить печать?"
                 if QMessageBox.question(self,"Проверка перед печатью",message,QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
         self._save_printer_settings();self._configure_page()
+        if self.paper_size_mismatch:
+            actual_w,actual_h=self.actual_paper_size
+            message=(f"Шаблон рассчитан на носитель {self.page_width:.2f} × {self.owner.template.height if self.rotation not in (90,270) else self.owner.template.width:.2f} мм, "
+                     f"а выбранный принтер сообщает {actual_w:.2f} × {actual_h:.2f} мм.\n\n"
+                     "При таком размере этикетка может уменьшиться или сместиться. Проверьте формат этикетки в настройках драйвера принтера.")
+            if QMessageBox.question(self,"Размер носителя не совпадает",message,
+                                    QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,
+                                    QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
         try:
             if not self.print_callback(self.printer,self.ordered,self.columns,self.page_width,self.rotation,
                                        self.start_spin.value(),self.end_spin.value(),self.copies_spin.value()):return
@@ -2720,11 +2734,16 @@ class MainWindow(QMainWindow):
         painter=QPainter()
         if not painter.begin(printer):raise RuntimeError("Не удалось открыть драйвер принтера.")
         try:
+            # Render in physical millimeters. The old viewport-width ratio silently
+            # scaled a 58 mm label down when a driver exposed a 55.5 mm drawable area.
+            scale=printer.resolution()/25.4
+            painter.scale(scale,scale)
+            label_width=ordered[0][0].width if ordered else self.template.width
+            label_height=ordered[0][0].height if ordered else self.template.height
+            page_width=label_width*columns+self.column_gap*(columns-1)
             for i,(template,row) in enumerate(ordered):
                 if i and i%columns==0 and not printer.newPage():raise RuntimeError("Драйвер не смог добавить следующую строку этикеток.")
-                page=QRectF(painter.viewport());label_width=ordered[0][0].width if ordered else self.template.width
-                cell_w=page.width()*label_width/width; gap_px=page.width()*self.column_gap/width
-                col=i%columns; cell=QRectF(col*(cell_w+gap_px),page.top(),cell_w,page.height())
+                col=i%columns; cell=QRectF(col*(label_width+self.column_gap),0,label_width,label_height)
                 self._paint_label(painter,row,cell,template,show_editor_background=preview)
         finally:painter.end()
 
