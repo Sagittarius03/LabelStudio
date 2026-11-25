@@ -69,11 +69,15 @@ def draw_text_layout(painter: QPainter, element: Element, rect: QRectF, text: st
     """Lay out text consistently and apply optional tracking/leading."""
     font=QFont(element.font_family)
     font_size_mm=max(.1,element.font_size*25.4/72)
-    font_px=max(1,round(font_size_mm));font_scale=font_size_mm/font_px
+    # QTextLayout rounds glyph advances at tiny font sizes (often 3–4 px here),
+    # which makes neighboring letters collide in the editor. Shape at 100 units
+    # per millimeter, then scale the finished layout back into label coordinates.
+    layout_units_per_mm=100
+    font_px=max(1,round(font_size_mm*layout_units_per_mm));font_scale=1/layout_units_per_mm
     font.setPixelSize(font_px)
     font.setBold(element.bold);font.setItalic(element.italic);font.setUnderline(element.underline)
     font.setStyleStrategy(QFont.StyleStrategy.ForceOutline)
-    font.setKerning(False)
+    font.setKerning(True)
     font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing,element.letter_spacing_pt*25.4/72/font_scale)
     layout=QTextLayout(str(text or ""),font)
     option=QTextOption()
@@ -84,7 +88,7 @@ def draw_text_layout(painter: QPainter, element: Element, rect: QRectF, text: st
                          "right":Qt.AlignmentFlag.AlignRight}.get(horizontal,Qt.AlignmentFlag.AlignLeft))
     layout.setTextOption(option);layout.beginLayout();lines=[];y=0.0
     line_gap=element.line_spacing_pt*25.4/72/font_scale
-    layout_width=max(0.1,rect.width()/font_scale)
+    layout_width=max(1.0,rect.width()/font_scale)
     while True:
         line=layout.createLine()
         if not line.isValid():break
@@ -379,12 +383,16 @@ class PrintPreviewDialog(QDialog):
         page_size=QPageSize(QSizeF(base_width,base_height),QPageSize.Unit.Millimeter,
                              "Label template",QPageSize.SizeMatchPolicy.ExactMatch)
         page_orientation=QPageLayout.Orientation.Landscape if landscape else QPageLayout.Orientation.Portrait
-        requested_layout=QPageLayout(page_size,page_orientation,QMarginsF(0,0,0,0),QPageLayout.Unit.Millimeter)
-        accepted=self.printer.setPageLayout(requested_layout)
+        # Apply size and orientation as separate Qt print-engine properties.
+        # Some Windows thermal drivers reject a complete QPageLayout when its
+        # zero-margin request conflicts with their non-printable margins, even
+        # though they accept the same custom paper size for the print job.
+        self.printer.setFullPage(True)
+        size_accepted=self.printer.setPageSize(page_size)
+        orientation_accepted=self.printer.setPageOrientation(page_orientation)
         effective=self.printer.pageLayout().fullRect(QPageLayout.Unit.Millimeter)
         self.effective_page_width=effective.width();self.effective_page_height=effective.height()
-        self.media_layout_applied=accepted and abs(effective.width()-self.page_width)<.05 and abs(effective.height()-label_h)<.05
-        self.printer.setFullPage(True)
+        self.media_layout_applied=size_accepted and orientation_accepted and abs(effective.width()-self.page_width)<.05 and abs(effective.height()-label_h)<.05
         self.printer.setCopyCount(1)  # Copies are expanded into the page sequence by the app.
         if self.media_layout_applied:
             self.columns_label.setText(f"Формат задания: {self.page_width:.2f} × {label_h:.2f} мм · {self.columns} колонок · зазор {self.gap:.2f} мм")
@@ -421,7 +429,8 @@ class PrintPreviewDialog(QDialog):
         self.ordered=self.build_order(self.start_spin.value(),self.end_spin.value(),self.copies_spin.value(),self.continue_check.isChecked(),self.reverse_check.isChecked())
         self._configure_page()
         pages=max(1,(len(self.ordered)+self.columns-1)//self.columns)
-        page_status=f"Формат задания: {self.page_width:.2f} × {self.page_height:.2f} мм" if self.media_layout_applied else "Драйвер отклонил формат страницы"
+        page_status=(f"Формат задания: {self.page_width:.2f} × {self.page_height:.2f} мм" if self.media_layout_applied else
+                     f"Запрошено из шаблона: {self.page_width:.2f} × {self.page_height:.2f} мм · драйвер сообщает: {self.effective_page_width:.2f} × {self.effective_page_height:.2f} мм")
         self.summary.setText(f"Этикеток: {len(self.ordered)}    Страниц: {pages}\nВарианты: {self.start_spin.value()}–{self.end_spin.value()} · копий диапазона: {self.copies_spin.value()}\n{page_status}")
         self.variation_label.setText(f"{self.available} вариантов доступно")
         self.preview.updatePreview();self._sync_pages()
