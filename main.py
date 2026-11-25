@@ -68,10 +68,13 @@ class Element:
 def draw_text_layout(painter: QPainter, element: Element, rect: QRectF, text: str):
     """Lay out text consistently and apply optional tracking/leading."""
     font=QFont(element.font_family)
-    font.setPixelSize(max(1,round(element.font_size*25.4/72)))
+    font_size_mm=max(.1,element.font_size*25.4/72)
+    font_px=max(1,round(font_size_mm));font_scale=font_size_mm/font_px
+    font.setPixelSize(font_px)
     font.setBold(element.bold);font.setItalic(element.italic);font.setUnderline(element.underline)
     font.setStyleStrategy(QFont.StyleStrategy.ForceOutline)
-    font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing,element.letter_spacing_pt*25.4/72)
+    font.setKerning(False)
+    font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing,element.letter_spacing_pt*25.4/72/font_scale)
     layout=QTextLayout(str(text or ""),font)
     option=QTextOption()
     option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
@@ -80,20 +83,25 @@ def draw_text_layout(painter: QPainter, element: Element, rect: QRectF, text: st
     option.setAlignment({"left":Qt.AlignmentFlag.AlignLeft,"center":Qt.AlignmentFlag.AlignHCenter,
                          "right":Qt.AlignmentFlag.AlignRight}.get(horizontal,Qt.AlignmentFlag.AlignLeft))
     layout.setTextOption(option);layout.beginLayout();lines=[];y=0.0
-    line_gap=element.line_spacing_pt*25.4/72
+    line_gap=element.line_spacing_pt*25.4/72/font_scale
+    layout_width=max(0.1,rect.width()/font_scale)
     while True:
         line=layout.createLine()
         if not line.isValid():break
-        line.setLineWidth(max(0.1,rect.width()));line.setPosition(QPointF(0,y));lines.append(line)
+        line.setLineWidth(layout_width);line.setPosition(QPointF(0,y));lines.append(line)
         y+=line.height()+line_gap
     layout.endLayout()
     if not lines:return
-    total_height=max(0.0,y-line_gap)
+    total_height=max(0.0,(y-line_gap)*font_scale)
     vertical="center" if element.kind=="symbol" else element.vertical_alignment
     vertical_offset={"top":0.0,"center":(rect.height()-total_height)/2,
                      "bottom":rect.height()-total_height}.get(vertical,(rect.height()-total_height)/2)
-    painter.save();painter.setClipRect(rect);painter.setPen(QColor(element.color))
-    layout.draw(painter,QPointF(rect.left(),rect.top()+vertical_offset))
+    painter.save()
+    # Keep descenders visible even when a text box was sized to the font cap height.
+    clip_slack=font_size_mm*.4
+    painter.setClipRect(QRectF(rect.left(),rect.top()-clip_slack*.2,rect.width(),rect.height()+clip_slack))
+    painter.setPen(QColor(element.color));painter.translate(rect.left(),rect.top()+vertical_offset);painter.scale(font_scale,font_scale)
+    layout.draw(painter,QPointF(0,0))
     painter.restore()
 
 
@@ -362,6 +370,7 @@ class PrintPreviewDialog(QDialog):
         label_w=self.owner.template.height if self.rotation in (90,270) else self.owner.template.width
         label_h=self.owner.template.width if self.rotation in (90,270) else self.owner.template.height
         self.page_width=label_w*self.columns+self.gap*(self.columns-1)
+        self.page_height=label_h
         # QPageSize is portrait-oriented. Define the short edge first, then ask
         # QPageLayout to rotate it for wide labels; passing 58x40 as Portrait
         # makes Windows label drivers apply the wrong feed direction.
@@ -370,11 +379,16 @@ class PrintPreviewDialog(QDialog):
         page_size=QPageSize(QSizeF(base_width,base_height),QPageSize.Unit.Millimeter,
                              "Label template",QPageSize.SizeMatchPolicy.ExactMatch)
         page_orientation=QPageLayout.Orientation.Landscape if landscape else QPageLayout.Orientation.Portrait
-        self.printer.setPageLayout(QPageLayout(page_size,page_orientation,
-                                               QMarginsF(0,0,0,0),QPageLayout.Unit.Millimeter))
+        requested_layout=QPageLayout(page_size,page_orientation,QMarginsF(0,0,0,0),QPageLayout.Unit.Millimeter)
+        accepted=self.printer.setPageLayout(requested_layout)
+        effective=self.printer.pageLayout().fullRect(QPageLayout.Unit.Millimeter)
+        self.media_layout_applied=accepted and abs(effective.width()-self.page_width)<.05 and abs(effective.height()-label_h)<.05
         self.printer.setFullPage(True)
         self.printer.setCopyCount(1)  # Copies are expanded into the page sequence by the app.
-        self.columns_label.setText(f"Текущая раскладка: {self.columns} колонок · зазор {self.gap:.2f} мм")
+        if self.media_layout_applied:
+            self.columns_label.setText(f"Формат задания: {self.page_width:.2f} × {label_h:.2f} мм · {self.columns} колонок · зазор {self.gap:.2f} мм")
+        else:
+            self.columns_label.setText(f"Драйвер не принял формат {self.page_width:.2f} × {label_h:.2f} мм. Проверьте размер носителя в настройках принтера.")
 
     @staticmethod
     def _page_layout_config(printer):
@@ -406,7 +420,8 @@ class PrintPreviewDialog(QDialog):
         self.ordered=self.build_order(self.start_spin.value(),self.end_spin.value(),self.copies_spin.value(),self.continue_check.isChecked(),self.reverse_check.isChecked())
         self._configure_page()
         pages=max(1,(len(self.ordered)+self.columns-1)//self.columns)
-        self.summary.setText(f"Этикеток: {len(self.ordered)}    Страниц: {pages}\nВарианты: {self.start_spin.value()}–{self.end_spin.value()} · копий диапазона: {self.copies_spin.value()}")
+        page_status=f"Формат задания: {self.page_width:.2f} × {self.page_height:.2f} мм" if self.media_layout_applied else "Драйвер отклонил формат страницы"
+        self.summary.setText(f"Этикеток: {len(self.ordered)}    Страниц: {pages}\nВарианты: {self.start_spin.value()}–{self.end_spin.value()} · копий диапазона: {self.copies_spin.value()}\n{page_status}")
         self.variation_label.setText(f"{self.available} вариантов доступно")
         self.preview.updatePreview();self._sync_pages()
 
@@ -478,6 +493,11 @@ class PrintPreviewDialog(QDialog):
                 message+="\n\nПродолжить печать?"
                 if QMessageBox.question(self,"Проверка перед печатью",message,QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
         self._save_printer_settings();self._configure_page()
+        if not self.media_layout_applied:
+            QMessageBox.warning(self,"Формат страницы не принят",
+                                f"Не удалось передать принтеру формат {self.page_width:.2f} × {self.page_height:.2f} мм. "
+                                "Откройте «Настройки принтера…», выберите или создайте такой носитель и повторите печать.")
+            return
         try:
             if not self.print_callback(self.printer,self.ordered,self.columns,self.page_width,self.rotation,
                                        self.start_spin.value(),self.end_spin.value(),self.copies_spin.value()):return
@@ -753,11 +773,13 @@ class LabelCanvas(QWidget):
         try:
             if el.kind == "qr":
                 import qrcode
-                pil = qrcode.make(text).convert("RGB")
+                qr=qrcode.QRCode(border=0,box_size=5)
+                qr.add_data(text);qr.make(fit=True)
+                pil=qr.make_image(fill_color="black",back_color="white").convert("RGB")
             elif el.kind == "datamatrix":
                 from pystrich.datamatrix import DataMatrixData, DataMatrixEncoder, FNC1
                 payload = DataMatrixData(FNC1, text, encoding="ascii") if el.gs1 else DataMatrixData(text, auto_encoding=True)
-                image = QImage.fromData(DataMatrixEncoder(payload).get_imagedata(cellsize=5))
+                image = QImage.fromData(DataMatrixEncoder(payload,quiet_zone=0).get_imagedata(cellsize=5))
                 return image if not image.isNull() else None
             else:
                 import barcode
@@ -767,7 +789,8 @@ class LabelCanvas(QWidget):
                 image_bytes = BytesIO()
                 symbology = {"Code 128": "code128", "Code 39": "code39", "EAN-13": "ean13", "UPC-A": "upca", "ITF": "itf"}.get(el.barcode_type, "code128")
                 barcode.get(symbology, text, writer=ImageWriter()).write(image_bytes,
-                    options={"module_height": 12, "quiet_zone": 1, "font_size": 0, "text_distance": 0, "write_text": False})
+                    options={"module_height": 12, "quiet_zone": 0, "margin_top": 0, "margin_bottom": 0,
+                             "font_size": 0, "text_distance": 0, "write_text": False})
                 pil = Image.open(image_bytes).convert("RGB")
             from io import BytesIO
             buf = BytesIO(); pil.save(buf, format="PNG")
