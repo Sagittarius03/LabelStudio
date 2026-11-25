@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt, QSize, QSizeF, QRectF, QPointF, Signal, QMarginsF, QSettings, QByteArray, QBuffer, QIODevice, QTimer
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QPageSize, QPageLayout, QAction, QKeySequence, QShortcut, QIcon
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap, QPageSize, QPageLayout, QAction, QKeySequence, QShortcut, QIcon, QTextLayout, QTextOption
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewWidget, QPrinterInfo
@@ -40,6 +40,8 @@ class Element:
     height: float = 8.0
     value: str = "Текст"
     font_size: float = 10.0
+    letter_spacing_pt: float = 0.0
+    line_spacing_pt: float = 0.0
     bold: bool = False
     color: str = "#000000"
     font_family: str = "Arial"
@@ -61,6 +63,49 @@ class Element:
     asset_data: str = ""
     layer_locked: bool = False
     lock_proportions: bool = False
+
+
+def draw_text_layout(painter: QPainter, element: Element, rect: QRectF, text: str):
+    """Draw text from explicit glyph positions so screen and printer metrics match."""
+    font=QFont(element.font_family)
+    font.setPixelSize(max(1,round(element.font_size*25.4/72)))
+    font.setBold(element.bold);font.setItalic(element.italic);font.setUnderline(False)
+    font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing,element.letter_spacing_pt*25.4/72)
+    layout=QTextLayout(str(text or ""),font)
+    option=QTextOption()
+    option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+    horizontal="center" if element.kind=="symbol" else element.horizontal_alignment
+    option.setAlignment({"left":Qt.AlignmentFlag.AlignLeft,"center":Qt.AlignmentFlag.AlignHCenter,
+                         "right":Qt.AlignmentFlag.AlignRight}.get(horizontal,Qt.AlignmentFlag.AlignLeft))
+    layout.setTextOption(option);layout.beginLayout();lines=[];y=0.0
+    line_gap=element.line_spacing_pt*25.4/72
+    while True:
+        line=layout.createLine()
+        if not line.isValid():break
+        line.setLineWidth(max(0.1,rect.width()));line.setPosition(QPointF(0,y));lines.append(line)
+        y+=line.height()+line_gap
+    layout.endLayout()
+    if not lines:return
+    total_height=max(0.0,y-line_gap)
+    vertical="center" if element.kind=="symbol" else element.vertical_alignment
+    vertical_offset={"top":0.0,"center":(rect.height()-total_height)/2,
+                     "bottom":rect.height()-total_height}.get(vertical,(rect.height()-total_height)/2)
+    painter.save();painter.setClipRect(rect);color=QColor(element.color)
+    for line_index,line in enumerate(lines):
+        offset_y=vertical_offset+line_index*line_gap
+        for run in layout.glyphRuns(line.textStart(),line.textLength()):
+            raw_font=run.rawFont()
+            for glyph,position in zip(run.glyphIndexes(),run.positions()):
+                path=raw_font.pathForGlyph(glyph)
+                path.translate(rect.left()+position.x(),rect.top()+position.y()+offset_y)
+                painter.fillPath(path,color)
+        if element.underline:
+            baseline=rect.top()+line.position().y()+line.ascent()+offset_y
+            underline_y=baseline+max(0.08,line.descent()*.25)
+            painter.setPen(QPen(color,max(.08,font.pixelSize()*.045)))
+            painter.drawLine(QPointF(rect.left()+line.position().x(),underline_y),
+                             QPointF(rect.left()+line.position().x()+line.naturalTextWidth(),underline_y))
+    painter.restore()
 
 
 def element_bounds_in_label(element: Element, template: "LabelTemplate", tolerance: float = 0.01) -> tuple[bool, bool]:
@@ -328,8 +373,12 @@ class PrintPreviewDialog(QDialog):
         label_w=self.owner.template.height if self.rotation in (90,270) else self.owner.template.width
         label_h=self.owner.template.width if self.rotation in (90,270) else self.owner.template.height
         self.page_width=label_w*self.columns+self.gap*(self.columns-1)
-        # Keep the media format selected in the printer driver. Replacing it with
-        # the template size here can make label printers switch to a nearby form.
+        # The template defines the physical label size. Keep the printer's driver
+        # options, but set the job page to the exact label/ribbon geometry.
+        page_size=QPageSize(QSizeF(self.page_width,label_h),QPageSize.Unit.Millimeter,
+                             "Label template",QPageSize.SizeMatchPolicy.ExactMatch)
+        self.printer.setPageLayout(QPageLayout(page_size,QPageLayout.Orientation.Portrait,
+                                               QMarginsF(0,0,0,0),QPageLayout.Unit.Millimeter))
         self.printer.setFullPage(True)
         self.printer.setCopyCount(1)  # Copies are expanded into the page sequence by the app.
         self.columns_label.setText(f"Текущая раскладка: {self.columns} колонок · зазор {self.gap:.2f} мм")
@@ -629,11 +678,8 @@ class LabelCanvas(QWidget):
             return
         if el.kind in ("text","symbol"):
             p.save()
-            px = max(6, int(el.font_size * 96 / 72 * scale / 3.78))
-            f = QFont(el.font_family); f.setPixelSize(px); f.setBold(el.bold); f.setItalic(el.italic); f.setUnderline(el.underline); p.setFont(f); p.setPen(QColor(el.color))
-            text = self.resolve(el.value)
-            flags=Qt.AlignmentFlag.AlignCenter if el.kind=="symbol" else self._text_flags(el)
-            p.drawText(r, flags, text)
+            p.translate(r.left(),r.top());p.scale(scale,scale)
+            draw_text_layout(p,el,QRectF(0,0,el.width,el.height),self.resolve(el.value))
             p.restore()
             return
         if el.kind in ("line","shape"):
@@ -1447,6 +1493,10 @@ class MainWindow(QMainWindow):
         self.variable_button=QToolButton(); self.variable_button.setText("Переменная ▾"); self.variable_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup); self.variable_menu=QMenu(self.variable_button); self.variable_button.setMenu(self.variable_menu)
         self.field_combo = QComboBox(); self.field_combo.addItem("Вручную", ""); self.field_combo.addItem("Нумерация тиража", "SEQ")
         self.x_spin = self.num(3, 0, 300); self.y_spin = self.num(3, 0, 300); self.w_spin = self.num(30, .1, 300); self.h_spin = self.num(8, .1, 300); self.font_spin = self.num(10, 1, 96)
+        self.letter_spacing_spin=self.num(0,-5,30);self.letter_spacing_spin.setDecimals(2);self.letter_spacing_spin.setSingleStep(.25);self.letter_spacing_spin.setSuffix(" pt")
+        self.letter_spacing_spin.setToolTip("Положительное значение раздвигает буквы, отрицательное сближает.")
+        self.line_spacing_spin=self.num(0,-5,30);self.line_spacing_spin.setDecimals(2);self.line_spacing_spin.setSingleStep(.25);self.line_spacing_spin.setSuffix(" pt")
+        self.line_spacing_spin.setToolTip("Дополнительный интервал между строками; отрицательное значение уменьшает его.")
         self.proportion_check=QCheckBox("Сохранять пропорции")
         self.barcode_combo = QComboBox(); self.barcode_combo.addItems(["Code 128", "Code 39", "EAN-13", "UPC-A", "ITF"])
         self.font_family_combo=QFontComboBox(); self.font_family_combo.setCurrentFont(QFont("Arial")); self.font_family_combo.setMaximumWidth(220)
@@ -1478,7 +1528,9 @@ class MainWindow(QMainWindow):
         self.content_form.addRow("Значение",value_row); self.content_form.addRow("Поле таблицы",self.field_combo)
         self.position_form.addRow("X, мм", self.x_spin); self.position_form.addRow("Y, мм", self.y_spin); self.position_form.addRow("Ширина, мм", self.w_spin); self.position_form.addRow("Высота, мм", self.h_spin)
         self.position_form.addRow("",self.proportion_check)
-        self.text_form.addRow("Символ",self.symbol_combo); self.text_form.addRow("Шрифт", self.font_family_combo); self.text_form.addRow("Размер, pt", self.font_spin); self.text_form.addRow("Стиль", self.style_box); self.text_form.addRow("Цвет", self.text_color_btn)
+        self.text_form.addRow("Символ",self.symbol_combo); self.text_form.addRow("Шрифт", self.font_family_combo); self.text_form.addRow("Размер, pt", self.font_spin)
+        self.text_form.addRow("Интервал букв",self.letter_spacing_spin);self.text_form.addRow("Интервал строк",self.line_spacing_spin)
+        self.text_form.addRow("Стиль", self.style_box); self.text_form.addRow("Цвет", self.text_color_btn)
         self.text_form.addRow("Выравнивание", self.align_h_combo); self.text_form.addRow("По вертикали", self.align_v_combo)
         self.rotation_spin = self.num(0, 0, 359.9); self.rotation_spin.setSuffix(" °")
         self.gs1_check = QCheckBox("GS1 / Честный знак")
@@ -1505,6 +1557,8 @@ class MainWindow(QMainWindow):
         self.hri_position_combo.currentIndexChanged.connect(lambda _=0:self.change_prop("hri_position",self.hri_position_combo.currentData()))
         self.hri_align_combo.currentIndexChanged.connect(lambda _=0:self.change_prop("hri_alignment",self.hri_align_combo.currentData()))
         self.hri_font_spin.valueChanged.connect(lambda value:self.change_prop("hri_font_size",value))
+        self.letter_spacing_spin.valueChanged.connect(lambda value:self.change_prop("letter_spacing_pt",value))
+        self.line_spacing_spin.valueChanged.connect(lambda value:self.change_prop("line_spacing_pt",value))
         for s, attr in [(self.x_spin, "x"), (self.y_spin, "y"), (self.w_spin, "width"), (self.h_spin, "height"), (self.font_spin, "font_size")]:
             s.valueChanged.connect(lambda v, a=attr: self.change_prop(a, v))
         self.crop_image_btn=QPushButton("Обрезать изображение…");self.crop_image_btn.clicked.connect(self.crop_selected_image);rl.addWidget(self.crop_image_btn)
@@ -2080,7 +2134,7 @@ class MainWindow(QMainWindow):
         for w in (self.value_edit,self.variable_button,self.field_combo):w.setEnabled(enabled and not asset_selected)
         if asset_selected:self.value_edit.setToolTip("Имя встроенного файла. Для замены удалите элемент и вставьте изображение заново.")
         else:self.value_edit.setToolTip("Текст или переменная, например {GTIN:Код}")
-        for w in (self.font_family_combo,self.font_spin,self.style_box,self.text_color_btn,self.align_h_combo,self.align_v_combo): w.setEnabled(text_selected)
+        for w in (self.font_family_combo,self.font_spin,self.letter_spacing_spin,self.line_spacing_spin,self.style_box,self.text_color_btn,self.align_h_combo,self.align_v_combo): w.setEnabled(text_selected)
         self.symbol_combo.setEnabled(symbol_selected)
         for w in (self.barcode_combo,self.hri_position_combo,self.hri_align_combo,self.hri_font_spin): w.setEnabled(barcode_selected)
         self.gs1_check.setEnabled(gs1_selected); self.dm_summary.setEnabled(gs1_selected)
@@ -2094,7 +2148,8 @@ class MainWindow(QMainWindow):
         elif barcode_selected or gs1_selected or (enabled and same_kind and el.kind=="qr"): self.property_tabs.setCurrentIndex(3)
         elif symbol_selected: self.property_tabs.setCurrentIndex(2)
         if enabled:
-            for s,v in [(self.x_spin,el.x),(self.y_spin,el.y),(self.w_spin,el.width),(self.h_spin,el.height),(self.font_spin,el.font_size)]:
+            for s,v in [(self.x_spin,el.x),(self.y_spin,el.y),(self.w_spin,el.width),(self.h_spin,el.height),(self.font_spin,el.font_size),
+                        (self.letter_spacing_spin,el.letter_spacing_pt),(self.line_spacing_spin,el.line_spacing_pt)]:
                 s.blockSignals(True); s.setValue(v); s.blockSignals(False)
             self.value_edit.blockSignals(True); self.value_edit.setText(el.value); self.value_edit.blockSignals(False)
             self.field_combo.blockSignals(True)
@@ -2575,7 +2630,7 @@ class MainWindow(QMainWindow):
             r=QRectF(el.x,el.y,el.width,el.height)
             painter.save(); painter.translate(r.center()); painter.rotate(el.rotation); painter.translate(-r.center())
             if el.kind in ("text","symbol"):
-                f=QFont(el.font_family); f.setPixelSize(max(1,round(el.font_size*25.4/72))); f.setBold(el.bold); f.setItalic(el.italic); f.setUnderline(el.underline); painter.setFont(f); painter.setPen(QColor(el.color)); flags=Qt.AlignmentFlag.AlignCenter if el.kind=="symbol" else self.canvas._text_flags(el); painter.drawText(r,flags,self._resolved(el.value,row))
+                draw_text_layout(painter,el,r,self._resolved(el.value,row))
             elif el.kind in ("line","shape"):
                 LabelCanvas._draw_vector_element(painter,el,r,1)
             elif el.kind=="image":
