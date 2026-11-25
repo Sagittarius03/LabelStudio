@@ -277,7 +277,8 @@ class PrintPreviewDialog(QDialog):
                  "color_mode":self.printer.colorMode().value,"duplex":self.printer.duplex().value,
                  "paper_source":self.printer.paperSource().value,"page_order":self.printer.pageOrder().value,
                  "collate":self.printer.collateCopies(),"orientation":self.orientation_combo.currentData(),
-                 "columns":self.owner.label_columns,"column_gap":self.owner.column_gap}
+                 "columns":self.owner.label_columns,"column_gap":self.owner.column_gap,
+                 "page_layout":self._page_layout_config(self.printer)}
         profiles=self._profiles();profiles[name]=profile
         self.owner.settings.setValue("printer/profiles",json.dumps(profiles,ensure_ascii=False));self.owner.settings.sync()
         self._refresh_profile_list(name)
@@ -300,6 +301,7 @@ class PrintPreviewDialog(QDialog):
             if "page_order" in profile:self.printer.setPageOrder(QPrinter.PageOrder(int(profile["page_order"])))
             if "collate" in profile:self.printer.setCollateCopies(bool(profile["collate"]))
         except (TypeError,ValueError):pass
+        self._restore_page_layout(self.printer,profile.get("page_layout"))
         if profile.get("orientation") is not None:
             profile_orientation=int(profile["orientation"])
             if profile_orientation==QPageLayout.Orientation.Landscape.value:profile_orientation=90
@@ -326,18 +328,34 @@ class PrintPreviewDialog(QDialog):
         label_w=self.owner.template.height if self.rotation in (90,270) else self.owner.template.width
         label_h=self.owner.template.width if self.rotation in (90,270) else self.owner.template.height
         self.page_width=label_w*self.columns+self.gap*(self.columns-1)
-        page_size=QPageSize(QSizeF(self.page_width,label_h),QPageSize.Unit.Millimeter,"Label layout",QPageSize.SizeMatchPolicy.ExactMatch)
-        page_orientation=QPageLayout.Orientation.Landscape if self.page_width>label_h else QPageLayout.Orientation.Portrait
-        layout=QPageLayout(page_size,page_orientation,QMarginsF(0,0,0,0),QPageLayout.Unit.Millimeter)
-        self.printer.setPageLayout(layout)
+        # Keep the media format selected in the printer driver. Replacing it with
+        # the template size here can make label printers switch to a nearby form.
         self.printer.setFullPage(True)
-        # Compare the media dimensions (paperRect), not the printable rectangle:
-        # non-printable margins must not shrink the label artwork.
-        paper=self.printer.paperRect(QPrinter.Unit.Millimeter)
-        self.paper_size_mismatch=(abs(paper.width()-self.page_width)>0.15 or abs(paper.height()-label_h)>0.15)
-        self.actual_paper_size=(paper.width(),paper.height())
         self.printer.setCopyCount(1)  # Copies are expanded into the page sequence by the app.
         self.columns_label.setText(f"Текущая раскладка: {self.columns} колонок · зазор {self.gap:.2f} мм")
+
+    @staticmethod
+    def _page_layout_config(printer):
+        layout=printer.pageLayout();size=layout.pageSize().size(QPageSize.Unit.Millimeter)
+        margins=layout.margins(QPageLayout.Unit.Millimeter)
+        return {"width_mm":size.width(),"height_mm":size.height(),
+                "name":layout.pageSize().name(),"orientation":layout.orientation().value,
+                "margins_mm":[margins.left(),margins.top(),margins.right(),margins.bottom()]}
+
+    @staticmethod
+    def _restore_page_layout(printer,config):
+        if not isinstance(config,dict):return
+        try:
+            width=float(config["width_mm"]);height=float(config["height_mm"])
+            if width<=0 or height<=0:return
+            page_size=QPageSize(QSizeF(width,height),QPageSize.Unit.Millimeter,
+                                str(config.get("name") or "Saved printer media"),
+                                QPageSize.SizeMatchPolicy.ExactMatch)
+            orientation=QPageLayout.Orientation(int(config.get("orientation",0)))
+            values=config.get("margins_mm",[0,0,0,0])
+            margins=QMarginsF(*(float(value) for value in values))
+            printer.setPageLayout(QPageLayout(page_size,orientation,margins,QPageLayout.Unit.Millimeter))
+        except (KeyError,TypeError,ValueError):pass
 
     def _refresh_job(self,*_):
         if not hasattr(self,"orientation_combo"):return
@@ -380,7 +398,7 @@ class PrintPreviewDialog(QDialog):
         printer_config={"name":self.printer.printerName(),"resolution":self.printer.resolution(),
                         "color_mode":self.printer.colorMode().value,"duplex":self.printer.duplex().value,
                         "paper_source":self.printer.paperSource().value,"page_order":self.printer.pageOrder().value,
-                        "collate":self.printer.collateCopies()}
+                        "collate":self.printer.collateCopies(),"page_layout":self._page_layout_config(self.printer)}
         settings.setValue("printer/name",printer_config["name"]);settings.setValue("printer/resolution",printer_config["resolution"])
         settings.setValue("printer/color_mode",printer_config["color_mode"]);settings.setValue("printer/duplex",printer_config["duplex"])
         settings.setValue("printer/paper_source",printer_config["paper_source"]);settings.setValue("printer/page_order",printer_config["page_order"])
@@ -418,14 +436,6 @@ class PrintPreviewDialog(QDialog):
                 message+="\n\nПродолжить печать?"
                 if QMessageBox.question(self,"Проверка перед печатью",message,QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
         self._save_printer_settings();self._configure_page()
-        if self.paper_size_mismatch:
-            actual_w,actual_h=self.actual_paper_size
-            message=(f"Шаблон рассчитан на носитель {self.page_width:.2f} × {self.owner.template.height if self.rotation not in (90,270) else self.owner.template.width:.2f} мм, "
-                     f"а выбранный принтер сообщает {actual_w:.2f} × {actual_h:.2f} мм.\n\n"
-                     "При таком размере этикетка может уменьшиться или сместиться. Проверьте формат этикетки в настройках драйвера принтера.")
-            if QMessageBox.question(self,"Размер носителя не совпадает",message,
-                                    QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,
-                                    QMessageBox.StandardButton.No)!=QMessageBox.StandardButton.Yes:return
         try:
             if not self.print_callback(self.printer,self.ordered,self.columns,self.page_width,self.rotation,
                                        self.start_spin.value(),self.end_spin.value(),self.copies_spin.value()):return
@@ -2684,6 +2694,7 @@ class MainWindow(QMainWindow):
             printer.setPageOrder(QPrinter.PageOrder(int(printer_config.get("page_order",self.settings.value("printer/page_order",printer.pageOrder().value)))))
             printer.setCollateCopies(bool(printer_config.get("collate",self.settings.value("printer/collate",True))))
         except (TypeError,ValueError):pass
+        PrintPreviewDialog._restore_page_layout(printer,printer_config.get("page_layout"))
         self.print_printer=printer
 
         def build_order(first,last,copies,continue_seq,reverse):
