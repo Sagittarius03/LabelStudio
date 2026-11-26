@@ -7,6 +7,7 @@ import json
 import math
 import re
 import sys
+from collections import OrderedDict
 from io import BytesIO
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -283,6 +284,10 @@ class PrintPreviewDialog(QDialog):
         for button in (zoom_out,zoom_in,fit_width,fit_page):preview_head.addWidget(button)
         preview_layout.addLayout(preview_head)
         self.preview=QPrintPreviewWidget(printer,self);self.preview.setZoomMode(QPrintPreviewWidget.ZoomMode.FitInView);preview_layout.addWidget(self.preview,1)
+        # Printer previews can be expensive for large variable-data runs. Coalesce
+        # rapid spin-box changes and render only the final requested page set.
+        self._preview_timer=QTimer(self);self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(120);self._preview_timer.timeout.connect(self.preview.updatePreview)
         body.addWidget(preview_card,1)
 
         self._refresh_profile_list()
@@ -336,8 +341,9 @@ class PrintPreviewDialog(QDialog):
 
     def _load_width_correction(self,printer_name):
         key=self._width_correction_key(printer_name)
-        default=2.5 if "gx43i" in str(printer_name).casefold() else 0.0
-        value=float(self.owner.settings.value(key,default))
+        # Start from the template's exact media dimensions. Any per-printer
+        # correction must be an explicit saved user choice, never a model guess.
+        value=float(self.owner.settings.value(key,0.0))
         self.width_correction_spin.blockSignals(True);self.width_correction_spin.setValue(value);self.width_correction_spin.blockSignals(False)
 
     def _width_correction_changed(self,value):
@@ -437,7 +443,9 @@ class PrintPreviewDialog(QDialog):
         orientation_accepted=self.printer.setPageOrientation(page_orientation)
         effective=self.printer.pageLayout().fullRect(QPageLayout.Unit.Millimeter)
         self.effective_page_width=effective.width();self.effective_page_height=effective.height()
-        expected_effective=(self.page_width,label_h+width_correction) if landscape else (self.driver_page_width,label_h)
+        # fullRect() is already reported in the selected orientation. The media
+        # width must stay the label/column width in either orientation.
+        expected_effective=(self.driver_page_width,label_h)
         self.media_layout_applied=(size_accepted and orientation_accepted and
                                    abs(effective.width()-expected_effective[0])<.05 and
                                    abs(effective.height()-expected_effective[1])<.05)
@@ -483,7 +491,7 @@ class PrintPreviewDialog(QDialog):
                      f"Шаблон {self.page_width:.2f} × {self.page_height:.2f} мм · драйверу: {self.driver_page_width:.2f} мм по ширине{correction_note} · сообщает: {self.effective_page_width:.2f} × {self.effective_page_height:.2f} мм")
         self.summary.setText(f"Этикеток: {len(self.ordered)}    Страниц: {pages}\nВарианты: {self.start_spin.value()}–{self.end_spin.value()} · копий диапазона: {self.copies_spin.value()}\n{page_status}")
         self.variation_label.setText(f"{self.available} вариантов доступно")
-        self.preview.updatePreview();self._sync_pages()
+        self._preview_timer.start();self._sync_pages()
 
     def _range_changed(self,*_):self._refresh_job()
 
@@ -595,6 +603,11 @@ class LabelCanvas(QWidget):
         self.show_grid = True
         self.show_guides = True
         self.preview_row: dict[str, Any] = {}
+        # Repainting is frequent while editing. Keep decoded assets and generated
+        # symbols around so paintEvent never repeats expensive image/barcode work.
+        self._asset_image_cache: OrderedDict[str, QImage] = OrderedDict()
+        self._svg_renderer_cache: OrderedDict[str, QSvgRenderer] = OrderedDict()
+        self._code_image_cache: OrderedDict[tuple, QImage | None] = OrderedDict()
         self.scale = 8.0
         self.zoom_factor=1.0
         self.pan_offset=QPointF(0,0)
@@ -759,7 +772,7 @@ class LabelCanvas(QWidget):
         if el.kind=="image":
             encoded=self.resolve(el.value) if el.value.startswith("{") else el.asset_data
             if not encoded:encoded=el.asset_data
-            image=QImage.fromData(base64.b64decode(encoded)) if encoded else QImage()
+            image=self.decoded_asset(encoded)
             if not image.isNull():p.drawImage(r,image)
             else:p.drawRect(r)
             return
@@ -767,14 +780,14 @@ class LabelCanvas(QWidget):
             try:
                 resolved=self.resolve(el.value)
                 encoded=resolved if el.value.startswith("{") and resolved else el.asset_data
-                image=QImage.fromData(base64.b64decode(encoded)) if encoded else QImage()
+                image=self.decoded_asset(encoded)
                 if not image.isNull():p.drawImage(r,image)
                 else:p.drawRect(r)
             except Exception:p.drawRect(r)
             return
         if el.kind=="svg":
             try:
-                renderer=QSvgRenderer(QByteArray(base64.b64decode(el.asset_data)))
+                renderer=self.svg_renderer(el.asset_data)
                 if renderer.isValid():renderer.render(p,r)
                 else:p.drawRect(r)
             except Exception:p.drawRect(r)
@@ -872,8 +885,46 @@ class LabelCanvas(QWidget):
             painter.drawText(QRectF(rect.left(),y,rect.width(),caption_height),flags,text)
         painter.restore()
 
+    @staticmethod
+    def _cache_put(cache, key, value, limit):
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > limit:
+            cache.popitem(last=False)
+        return value
+
+    def decoded_asset(self, encoded: str) -> QImage:
+        if not encoded:
+            return QImage()
+        cached = self._asset_image_cache.get(encoded)
+        if cached is not None:
+            self._asset_image_cache.move_to_end(encoded)
+            return cached
+        try:
+            image = QImage.fromData(base64.b64decode(encoded))
+        except Exception:
+            image = QImage()
+        return self._cache_put(self._asset_image_cache, encoded, image, 16)
+
+    def svg_renderer(self, encoded: str) -> QSvgRenderer:
+        renderer = self._svg_renderer_cache.get(encoded)
+        if renderer is not None:
+            self._svg_renderer_cache.move_to_end(encoded)
+            return renderer
+        try:
+            renderer = QSvgRenderer(QByteArray(base64.b64decode(encoded)))
+        except Exception:
+            renderer = QSvgRenderer()
+        return self._cache_put(self._svg_renderer_cache, encoded, renderer, 16)
+
     def code_image(self, el: Element) -> QImage | None:
         text = self.resolve(el.value) or "SAMPLE"
+        if el.kind == "datamatrix" and el.gs1:
+            text = normalize_gs1_payload(text)
+        cache_key = (el.kind, el.barcode_type, text, bool(el.gs1))
+        if cache_key in self._code_image_cache:
+            self._code_image_cache.move_to_end(cache_key)
+            return self._code_image_cache[cache_key]
         try:
             if el.kind == "qr":
                 import qrcode
@@ -882,11 +933,11 @@ class LabelCanvas(QWidget):
                 pil=qr.make_image(fill_color="black",back_color="white").convert("RGB")
             elif el.kind == "datamatrix":
                 from pystrich.datamatrix import DataMatrixData, DataMatrixEncoder, FNC1
-                text=normalize_gs1_payload(text) if el.gs1 else text
                 text=text.replace("<GS>","\x1d")
                 payload = DataMatrixData(FNC1, text, encoding="ascii") if el.gs1 else DataMatrixData(text, auto_encoding=True)
                 image = QImage.fromData(DataMatrixEncoder(payload,quiet_zone=0).get_imagedata(cellsize=5))
-                return image if not image.isNull() else None
+                result = image if not image.isNull() else None
+                return self._cache_put(self._code_image_cache, cache_key, result, 96)
             else:
                 import barcode
                 from barcode.writer import ImageWriter
@@ -901,9 +952,10 @@ class LabelCanvas(QWidget):
             from io import BytesIO
             buf = BytesIO(); pil.save(buf, format="PNG")
             image = QImage.fromData(buf.getvalue())
-            return image if not image.isNull() else None
+            result = image if not image.isNull() else None
+            return self._cache_put(self._code_image_cache, cache_key, result, 96)
         except Exception:
-            return None
+            return self._cache_put(self._code_image_cache, cache_key, None, 96)
 
     def mousePressEvent(self, event):
         if event.button()==Qt.MouseButton.MiddleButton or (event.button()==Qt.MouseButton.LeftButton and self.pan_mode):
@@ -1324,17 +1376,19 @@ def image_to_base64(image: QImage) -> str:
 class PdfPageCropCanvas(QWidget):
     def __init__(self,document: QPdfDocument,page=0,parent=None):
         super().__init__(parent);self.document=document;self.page=page;self.image=QImage();self.selection=None;self.drag_origin=None;self.draw_rect=QRectF()
+        self.zoom_factor=1.0;self.pan_offset=QPointF();self.pan_start=None
         self.setMinimumSize(500,500);self.setMouseTracking(True);self.load_page(page)
 
     def load_page(self,page):
         self.page=page;size=self.document.pagePointSize(page);width=1200;height=max(1,round(width*size.height()/max(size.width(),1)))
-        self.image=self.document.render(page,QSize(width,height));self.selection=None;self.update()
+        self.image=self.document.render(page,QSize(width,height));self.selection=None;self.zoom_factor=1.0;self.pan_offset=QPointF();self.update()
 
     def paintEvent(self,_event):
         painter=QPainter(self);painter.fillRect(self.rect(),QColor("#e8edf3"))
         if self.image.isNull():return
-        scale=min((self.width()-24)/self.image.width(),(self.height()-24)/self.image.height())
-        w=self.image.width()*scale;h=self.image.height()*scale;self.draw_rect=QRectF((self.width()-w)/2,(self.height()-h)/2,w,h)
+        scale=self._fit_scale()*self.zoom_factor
+        w=self.image.width()*scale;h=self.image.height()*scale
+        self.draw_rect=QRectF((self.width()-w)/2+self.pan_offset.x(),(self.height()-h)/2+self.pan_offset.y(),w,h)
         painter.drawImage(self.draw_rect,self.image);painter.setPen(QPen(QColor("#64748b"),1));painter.drawRect(self.draw_rect)
         if self.selection is not None:
             selected=QRectF(self.draw_rect.left()+self.selection.left()*scale,self.draw_rect.top()+self.selection.top()*scale,self.selection.width()*scale,self.selection.height()*scale)
@@ -1346,15 +1400,43 @@ class PdfPageCropCanvas(QWidget):
         y=min(max((point.y()-self.draw_rect.top())/scale,0),self.image.height())
         return QPointF(x,y)
 
+    def _fit_scale(self):
+        if self.image.isNull():return 1.0
+        return max(.01,min((self.width()-24)/self.image.width(),(self.height()-24)/self.image.height()))
+
+    def zoom_by(self,factor,anchor=None):
+        if self.image.isNull():return
+        anchor=anchor or QPointF(self.width()/2,self.height()/2)
+        old_scale=self._fit_scale()*self.zoom_factor
+        world_x=(anchor.x()-self.draw_rect.left())/old_scale;world_y=(anchor.y()-self.draw_rect.top())/old_scale
+        self.zoom_factor=min(8.0,max(.25,self.zoom_factor*factor));new_scale=self._fit_scale()*self.zoom_factor
+        base_x=(self.width()-self.image.width()*new_scale)/2;base_y=(self.height()-self.image.height()*new_scale)/2
+        self.pan_offset=QPointF(anchor.x()-world_x*new_scale-base_x,anchor.y()-world_y*new_scale-base_y)
+        self.update()
+
+    def fit_page(self):
+        self.zoom_factor=1.0;self.pan_offset=QPointF();self.update()
+
+    def wheelEvent(self,event):
+        delta=event.angleDelta().y()
+        if delta:self.zoom_by(1.2 if delta>0 else 1/1.2,event.position())
+        event.accept()
+
     def mousePressEvent(self,event):
+        if event.button()==Qt.MouseButton.MiddleButton:
+            self.pan_start=(event.position(),QPointF(self.pan_offset));self.setCursor(Qt.CursorShape.ClosedHandCursor);event.accept();return
         if event.button()==Qt.MouseButton.LeftButton and self.draw_rect.contains(event.position()):
             self.drag_origin=self._image_point(event.position());self.selection=QRectF(self.drag_origin,self.drag_origin);self.update()
 
     def mouseMoveEvent(self,event):
+        if self.pan_start is not None:
+            start,offset=self.pan_start;delta=event.position()-start;self.pan_offset=offset+delta;self.update();return
         if self.drag_origin is not None:
             self.selection=QRectF(self.drag_origin,self._image_point(event.position())).normalized();self.update()
 
     def mouseReleaseEvent(self,event):
+        if event.button()==Qt.MouseButton.MiddleButton and self.pan_start is not None:
+            self.pan_start=None;self.unsetCursor();event.accept();return
         if self.drag_origin is not None:
             self.selection=QRectF(self.drag_origin,self._image_point(event.position())).normalized();self.drag_origin=None;self.update()
 
@@ -1370,9 +1452,13 @@ class PdfRegionDialog(QDialog):
         super().__init__(parent);self.path=Path(path);self.document=QPdfDocument(self);error=self.document.load(str(self.path))
         if error!=QPdfDocument.Error.None_:raise ValueError(f"Не удалось открыть PDF: {error}")
         self.setWindowTitle("Выбрать область PDF");self.resize(1000,780)
-        layout=QVBoxLayout(self);bar=QHBoxLayout();bar.addWidget(QLabel("Страница"));self.page_spin=QSpinBox();self.page_spin.setRange(1,max(1,self.document.pageCount()));bar.addWidget(self.page_spin);bar.addStretch()
+        layout=QVBoxLayout(self);bar=QHBoxLayout();bar.addWidget(QLabel("Страница"));self.page_spin=QSpinBox();self.page_spin.setRange(1,max(1,self.document.pageCount()));bar.addWidget(self.page_spin)
+        zoom_out=QPushButton("−");zoom_in=QPushButton("+");fit=QPushButton("Вписать")
+        zoom_out.setToolTip("Уменьшить PDF");zoom_in.setToolTip("Увеличить PDF");fit.setToolTip("Показать страницу целиком")
+        bar.addWidget(zoom_out);bar.addWidget(zoom_in);bar.addWidget(fit);bar.addStretch()
         self.hint=QLabel("Обведите элемент или этикетку: границы подстроятся по содержимому, текст и GS1/DataMatrix добавятся редактируемыми объектами.");self.hint.setWordWrap(True);bar.addWidget(self.hint);layout.addLayout(bar)
         self.canvas=PdfPageCropCanvas(self.document);layout.addWidget(self.canvas,1);self.page_spin.valueChanged.connect(lambda value:self.canvas.load_page(value-1))
+        zoom_out.clicked.connect(lambda:self.canvas.zoom_by(1/1.2));zoom_in.clicked.connect(lambda:self.canvas.zoom_by(1.2));fit.clicked.connect(self.canvas.fit_page)
         buttons=QDialogButtonBox(QDialogButtonBox.StandardButton.Ok|QDialogButtonBox.StandardButton.Cancel);buttons.accepted.connect(self._accept_crop);buttons.rejected.connect(self.reject);layout.addWidget(buttons)
 
     def _accept_crop(self):
@@ -1501,6 +1587,7 @@ class MainWindow(QMainWindow):
         self.column_gap = float(self.settings.value("column_gap",0.0))
         self.template_editors=[];self.composition_tab=None
         self.documents=[];self.document=None
+        self._template_file_cache={}
         self.history_timer=QTimer(self);self.history_timer.setSingleShot(True);self.history_timer.setInterval(250);self.history_timer.timeout.connect(self._commit_history_change)
         icon_root=Path(getattr(sys,"_MEIPASS",Path(__file__).resolve().parent))
         icon_path=icon_root/"assets"/"labelstudio.ico"
@@ -1564,20 +1651,22 @@ class MainWindow(QMainWindow):
         for button in (self.layer_up_btn,self.layer_down_btn,self.layer_lock_btn):layer_controls.addWidget(button)
         ll.addLayout(layer_controls)
         duplicate_button=QPushButton("Дублировать объект");duplicate_button.setToolTip("Создать копию выбранного объекта со всеми его данными (Ctrl+D)");duplicate_button.clicked.connect(self.duplicate_selected_object);ll.addWidget(duplicate_button)
-        self.add_buttons = QGridLayout(); self.add_buttons.setContentsMargins(0,0,0,0); self.add_buttons.setHorizontalSpacing(4); self.add_buttons.setVerticalSpacing(4)
+        add_title=QLabel("Добавить элемент");add_title.setStyleSheet("font-weight:600;color:#465266;padding-top:4px");ll.addWidget(add_title)
+        self.add_buttons = QGridLayout(); self.add_buttons.setContentsMargins(0,0,0,0); self.add_buttons.setHorizontalSpacing(6); self.add_buttons.setVerticalSpacing(5)
         insert_items = [
-            ("Текст","text","Текст","T",0,0),("Штрихкод","barcode","123456789","▥",0,1),("QR","qr","https://","⌗",0,2),
-            ("DataMatrix","datamatrix","010460123456789021ABC","▦",1,0),("Линия","line","","／",1,1),("Фигура","shape","","□",1,2),
-            ("Изображение","image","","▧",2,0),("SVG","svg","","◇",2,1),("Символ","symbol","★","★",3,0),
-            ("Элемент PDF","pdf","","▤",4,0),
+            ("Текст","text","Текст","T",0,0,1), ("Штрихкод","barcode","123456789","▥",0,1,1),
+            ("QR","qr","https://","⌗",1,0,1), ("DataMatrix","datamatrix","010460123456789021ABC","▦",1,1,1),
+            ("Линия","line","","／",2,0,1), ("Фигура","shape","","□",2,1,1),
+            ("Изображение","image","","▧",3,0,1), ("SVG","svg","","◇",3,1,1),
+            ("Символ","symbol","★","★",4,0,2), ("Элемент PDF","pdf","","▤",5,0,2),
         ]
-        for name,kind,val,glyph,row,col in insert_items:
-            btn=QPushButton(name); btn.setIcon(self.glyph_icon(glyph)); btn.setToolTip(f"Добавить объект: {name}")
+        for name,kind,val,glyph,row,col,span in insert_items:
+            btn=QPushButton(name); btn.setIcon(self.glyph_icon(glyph)); btn.setToolTip(f"Добавить объект: {name}");btn.setMinimumHeight(36)
             if kind=="image":btn.clicked.connect(self.insert_image)
             elif kind=="svg":btn.clicked.connect(self.insert_svg)
             elif kind=="pdf":btn.clicked.connect(self.insert_pdf_element)
             else:btn.clicked.connect(lambda _=False,k=kind,v=val:self.add_element(k,v))
-            self.add_buttons.addWidget(btn,row,col,1,3 if kind=="symbol" else 1)
+            self.add_buttons.addWidget(btn,row,col,1,span)
         ll.addLayout(self.add_buttons)
         self.canvas = LabelCanvas(self.template);self._connect_canvas(self.canvas)
         self.editor_tabs=QTabWidget();self.editor_tabs.setDocumentMode(True);self.editor_tabs.setTabsClosable(True);self.editor_tabs.setMovable(False)
@@ -2997,7 +3086,7 @@ class MainWindow(QMainWindow):
         painter.fillRect(QRectF(0,0,template.width,template.height),QColor(template.background))
         if show_editor_background and template.background_image and template.background_image_visible:
             try:
-                background=QImage.fromData(base64.b64decode(template.background_image))
+                background=self.canvas.decoded_asset(template.background_image)
                 if not background.isNull():
                     target=QRectF(0,0,template.width,template.height)
                     if template.background_image_fit=="contain":
@@ -3019,15 +3108,15 @@ class MainWindow(QMainWindow):
             elif el.kind=="image":
                 encoded=self._resolved(el.value,row) if el.value.startswith("{") else el.asset_data
                 if not encoded:encoded=el.asset_data
-                image=QImage.fromData(base64.b64decode(encoded)) if encoded else QImage()
+                image=self.canvas.decoded_asset(encoded)
                 if not image.isNull():painter.drawImage(r,image)
             elif el.kind=="pdf":
                 encoded=self._resolved(el.value,row) if el.value.startswith("{") else el.asset_data
                 if not encoded:encoded=el.asset_data
-                image=QImage.fromData(base64.b64decode(encoded)) if encoded else QImage()
+                image=self.canvas.decoded_asset(encoded)
                 if not image.isNull():painter.drawImage(r,image)
             elif el.kind=="svg":
-                renderer=QSvgRenderer(QByteArray(base64.b64decode(el.asset_data)))
+                renderer=self.canvas.svg_renderer(el.asset_data)
                 if renderer.isValid():renderer.render(painter,r)
             else:
                 copy=Element(**asdict(el)); copy.value=self._resolved(el.value,row); image=self.canvas.code_image(copy)
@@ -3066,11 +3155,17 @@ class MainWindow(QMainWindow):
         if identity=="__current__":return self.template
         for block in self.composition_blocks:
             if block.path==identity:
-                try:
-                    return self._template_from_file(block.path)
-                except Exception:
-                    return block.template
+                return self._load_template_cached(block.path,block.template)
         return self.template
+
+    def _load_template_cached(self,path,fallback=None):
+        try:
+            resolved=str(Path(path).resolve());stat=Path(resolved).stat();signature=(stat.st_mtime_ns,stat.st_size)
+            cached=self._template_file_cache.get(resolved)
+            if cached and cached[0]==signature:return cached[1]
+            loaded=self._template_from_file(resolved);self._template_file_cache[resolved]=(signature,loaded);return loaded
+        except Exception:
+            return fallback or self.template
 
     def template_occurrence_before(self,index,identity):
         blocks=[(b.path or "__current__",max(1,int(b.copies))) for b in self.composition_blocks] or [("__current__",1)]
